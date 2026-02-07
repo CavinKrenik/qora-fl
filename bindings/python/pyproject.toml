@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "qora-fl"
-version = "0.2.0"
+version = "0.3.0"
 description = "Qora: Quorum-Oriented Robust Aggregation for Federated Learning"
 readme = "../../README.md"
 requires-python = ">=3.8"
@@ -15,6 +15,9 @@ keywords = ["federated-learning", "byzantine-tolerance", "machine-learning"]
 dependencies = [
     "numpy>=1.21.0",
 ]
+
+[project.optional-dependencies]
+flower = ["flwr>=1.5.0"]
 
 [project.urls]
 Homepage = "https://github.com/CavinKrenik/qora-fl"

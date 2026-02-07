@@ -3,44 +3,72 @@ name: Release to PyPI
 on:
   release:
     types: [published]
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build-and-publish:
-    name: Build and publish Python package
+  build-wheels:
+    name: Build wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install maturin
+      run: pip install maturin
+    - name: Build wheels
+      run: |
+        cd bindings/python
+        maturin build --release --features python --out dist
+    - name: Upload wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-${{ matrix.os }}
+        path: bindings/python/dist/
+
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install maturin
+      run: pip install maturin
+    - name: Build sdist
+      run: |
+        cd bindings/python
+        maturin sdist --out dist
+    - name: Upload sdist
+      uses: actions/upload-artifact@v4
+      with:
+        name: sdist
+        path: bindings/python/dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/qora-fl
     permissions:
-      id-token: write  # IMPORTANT: this permission is mandatory for trusted publishing
-
+      id-token: write
     steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Rust
-      uses: actions-rs/toolchain@v1
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
       with:
-        toolchain: stable
-        override: true
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-
-    - name: Install maturin
-      run: pip install maturin
-
-    - name: Build wheels
-      run: |
-        cd bindings/python
-        maturin build --release --features python --out dist
-
+        path: dist
+        merge-multiple: true
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
-        packages-dir: bindings/python/dist/
+        packages-dir: dist/

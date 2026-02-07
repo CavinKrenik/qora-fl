@@ -23,10 +23,12 @@ pub use trimmed_mean::trimmed_mean;
 use ndarray::Array2;
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::QoraError;
 
 /// Aggregation method selection.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AggregationMethod {
     /// Coordinate-wise trimmed mean (default, ~30% Byzantine tolerance)
     TrimmedMean,
@@ -60,6 +62,7 @@ pub enum AggregationMethod {
 /// let result = agg.aggregate(&updates, None).unwrap();
 /// assert!((result[[0, 0]] - 1.0).abs() < 0.5);
 /// ```
+#[derive(Serialize, Deserialize)]
 pub struct ByzantineAggregator {
     method: AggregationMethod,
     trim_fraction: f32,

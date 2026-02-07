@@ -2,19 +2,20 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master, main ]
   pull_request:
-    branches: [ main ]
+    branches: [ master, main ]
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-    - uses: actions/checkout@v3
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
     - name: Build
       run: cargo build --verbose
     - name: Run tests
@@ -23,3 +24,43 @@ jobs:
       run: |
         cargo run --example quickstart
         cargo run --example compare_methods
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install maturin
+      run: pip install maturin
+    - name: Build and install Python package
+      run: |
+        cd bindings/python
+        maturin develop --features python
+    - name: Test Python imports
+      run: |
+        python -c "from qora import ByzantineAggregator, ReputationManager; print('imports OK')"
+        python -c "
+        import numpy as np
+        from qora import ByzantineAggregator
+        agg = ByzantineAggregator('trimmed_mean', 0.2)
+        updates = [np.array([[1.0, 2.0]], dtype=np.float32) for _ in range(5)]
+        result = agg.aggregate(updates)
+        assert result.shape == (1, 2), f'unexpected shape: {result.shape}'
+        print('aggregation OK')
+        "
+        python -c "
+        from qora import ReputationManager
+        rep = ReputationManager(ban_threshold=0.2)
+        rep.reward('a', 0.1)
+        rep.penalize('b', 0.4)
+        assert rep.get_score('a') == 0.6
+        assert rep.is_banned('b')
+        json_str = rep.to_json()
+        rep2 = ReputationManager.from_json(json_str, ban_threshold=0.2)
+        assert rep2.get_score('a') == 0.6
+        print('ReputationManager OK')
+        "

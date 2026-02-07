@@ -46,7 +46,7 @@ Clients produce model updates
 │  ┌─────────────────────┐  │
 │  │ Trimmed Mean (~30%) │  │
 │  │ Median      (~50%)  │  │
-│  │ Krum   (n ≥ 2f+3)   │  │ 
+│  │ Krum   (n ≥ 2f+3)   │  │
 │  │ FedAvg  (baseline)  │  │
 │  └─────────────────────┘  │
 └─────────────┬─────────────┘
@@ -264,7 +264,7 @@ maturin develop --features python
 
 1. Blanchard, P., El Mhamdi, E. M., Guerraoui, R., & Stainer, J. (2017). Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent. *NeurIPS*.
 2. Yin, D., Chen, Y., Ramchandran, K., & Bartlett, P. (2018). Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates. *ICML*.
-3. Krenik, C. (2025). QRES: Resource-Aware Agentic Swarm for Distributed Learning. *Zenodo*. [DOI: 10.5281/zenodo.18513738](https://doi.org/10.5281/zenodo.18513738)
+3. Krenik, C. (2025). QRES: Resource-Aware Agentic Swarm for Distributed Learning. *Zenodo*. [DOI: 10.5281/zenodo.18474976](https://doi.org/10.5281/zenodo.18474976)
 
 ## License
 

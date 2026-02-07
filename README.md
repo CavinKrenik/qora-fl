@@ -27,7 +27,7 @@ Qora-FL is designed as **infrastructure**, emphasizing:
 
 | Feature | FedAvg | Typical Robust FL | Qora-FL |
 |---------|--------|-------------------|---------|
-| Byzantine tolerance | -- | Paper-only | Validated (181-day deployment) |
+| Byzantine tolerance | -- | Paper-only | Algorithms informed by 181-day QRES deployment |
 | Deterministic option | -- | -- | Q16.16 fixed-point |
 | Reputation tracking | -- | -- | Deviation-derived, persistent |
 | Flower integration | Native | -- | Drop-in `QoraStrategy` |
@@ -64,23 +64,6 @@ Clients produce model updates
               │
               ▼
      Verified Global Update
-```
-
-```mermaid
-flowchart LR
-    C1[Client 1] --> U[Client Updates]
-    C2[Client 2] --> U
-    Cn[Client N] --> U
-
-    U --> A[Qora Aggregator]
-
-    A -->|Deviation Signal| R[Reputation Manager]
-    R -->|Scores / Gates| A
-
-    A --> G[Aggregated Model]
-
-    style A fill:#f3f6ff,stroke:#4a6cf7,stroke-width:2px
-    style R fill:#fff7e6,stroke:#f59e0b,stroke-width:2px
 ```
 
 ## Determinism & Reproducibility
@@ -161,9 +144,12 @@ from qora import ReputationManager
 
 rep = ReputationManager(ban_threshold=0.2)
 rep.reward("hospital_A", 0.02)
-rep.penalize("hospital_bad", 0.08)
 
-print(rep.is_banned("hospital_bad"))  # True after enough penalties
+# Penalize repeatedly -- simulates multiple rounds of bad behavior
+for _ in range(5):
+    rep.penalize("hospital_bad", 0.08)
+
+print(rep.is_banned("hospital_bad"))  # True (score dropped below 0.2)
 print(rep.active_clients())           # Only non-banned clients
 
 # Persist between server restarts
@@ -240,7 +226,7 @@ cargo run --example compare_methods
 
 ## Background
 
-Core algorithms validated in [QRES](https://github.com/CavinKrenik/RaaS) (181-day autonomous IoT deployment with 30% Byzantine tolerance across ESP32 mesh networks). Qora-FL adapts this proven consensus to server-side federated learning with Rust-performance aggregation and Python/Flower integration.
+The aggregation algorithms in Qora-FL (trimmed mean, coordinate-wise median, Krum) are standard Byzantine-robust aggregation methods from the federated learning literature [1][2]. The specific design decisions -- deviation-derived reputation, Q16.16 deterministic paths, and the 0.8 influence cap -- were informed by operational experience during a 181-day autonomous IoT deployment ([QRES](https://github.com/CavinKrenik/RaaS)). The Qora-FL codebase is a clean-room Rust implementation; it does not share code with the original QRES prototype.
 
 ## Design Philosophy
 
@@ -252,6 +238,33 @@ Qora-FL treats aggregation as a **decision process**, not a statistical convenie
 - Adaptive trim selection based on detected attack intensity
 - TensorFlow Federated adapter
 - Formal verification experiments for the deterministic path
+
+## Requirements
+
+- **Rust:** edition 2021, stable toolchain
+- **Python:** >= 3.8 (bindings built with PyO3 abi3)
+- **NumPy:** >= 1.21.0
+- **Flower** (optional): >= 1.5.0 (`pip install qora-fl[flower]`)
+
+### Building from Source
+
+```bash
+# Rust
+cargo build
+cargo test
+cargo doc --open
+
+# Python bindings
+cd bindings/python
+pip install maturin
+maturin develop --features python
+```
+
+## References
+
+1. Blanchard, P., El Mhamdi, E. M., Guerraoui, R., & Stainer, J. (2017). Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent. *NeurIPS*.
+2. Yin, D., Chen, Y., Ramchandran, K., & Bartlett, P. (2018). Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates. *ICML*.
+3. Krenik, C. (2025). QRES: Resource-Aware Agentic Swarm for Distributed Learning. *Zenodo*. [DOI: 10.5281/zenodo.18513738](https://doi.org/10.5281/zenodo.18513738)
 
 ## License
 

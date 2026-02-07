@@ -1,19 +1,11 @@
-//! Reputation Tracking Module for Sybil Resistance
+//! Reputation Tracking for Sybil Resistance
 //!
-//! Provides a `ReputationTracker` that maintains trust scores per peer.
-//! Scores increase with valid ZKP submissions and decrease when drift
-//! is detected during aggregation. Used to weight nodes in
-//! `WeightedTrimmedMean` aggregation.
+//! Provides a `ReputationTracker` that maintains trust scores per client.
+//! Scores increase with valid contributions and decrease when drift
+//! is detected during aggregation. Used to weight clients in
+//! Byzantine-tolerant aggregation.
 
-#[cfg(not(feature = "std"))]
-use alloc::collections::BTreeMap;
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
-#[cfg(feature = "std")]
 use std::collections::BTreeMap;
-#[cfg(feature = "std")]
-use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 

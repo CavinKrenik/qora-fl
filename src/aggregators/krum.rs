@@ -5,11 +5,6 @@
 //!
 //! Reference: "Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent"
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use std::vec::Vec;
-
 use fixed::types::I16F16;
 use serde::{Deserialize, Serialize};
 
@@ -123,8 +118,7 @@ pub fn aggregate_krum(vectors: &[Vec<I16F16>], f: usize) -> Option<Vec<I16F16>> 
     }
 
     // Theoretical requirement is n >= 2f + 3.
-    // If not met, we proceed best-effort but warn (if std available)
-    #[cfg(feature = "std")]
+    // If not met, we proceed best-effort but warn.
     if n < 2 * f + 3 {
         eprintln!(
             "WARN: Krum condition not met (n={} < 2*f+3={}). Proceeding with best-effort.",

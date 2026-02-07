@@ -1,6 +1,6 @@
 [package]
 name = "qora-fl"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2021"
 authors = ["Cavin Krenik <cavinkrenik5@icloud.com>"]
 license = "MIT OR Apache-2.0"
@@ -22,10 +22,6 @@ rayon = "1.8"
 fixed = "1.24"
 blake3 = "1.5"
 curve25519-dalek = "4.0"
-
-[features]
-default = ["std"]
-std = []
 
 [dev-dependencies]
 criterion = "0.5"

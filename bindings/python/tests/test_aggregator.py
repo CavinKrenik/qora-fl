@@ -34,11 +34,55 @@ class TestByzantineAggregator:
         assert result[0, 0] > 10.0, "FedAvg should be corrupted by attackers"
 
     def test_all_methods(self):
-        for method in ["trimmed_mean", "median", "fedavg"]:
+        for method in ["trimmed_mean", "median", "fedavg", "krum"]:
             agg = ByzantineAggregator(method, 0.2)
             updates = [np.array([[1.0]], dtype=np.float32) for _ in range(5)]
             result = agg.aggregate(updates)
             np.testing.assert_allclose(result, [[1.0]], atol=1e-6)
+
+    def test_krum_rejects_attackers(self):
+        agg = ByzantineAggregator("krum", 0.0)
+        updates = [np.array([[1.0, 2.0]], dtype=np.float32) for _ in range(4)]
+        updates += [np.array([[100.0, 200.0]], dtype=np.float32)]
+        result = agg.aggregate(updates)
+        assert result[0, 0] < 2.0
+
+    def test_krum_custom_f(self):
+        agg = ByzantineAggregator("krum:2", 0.0)
+        updates = [np.array([[1.0]], dtype=np.float32) for _ in range(7)]
+        result = agg.aggregate(updates)
+        np.testing.assert_allclose(result, [[1.0]], atol=1e-6)
+
+    def test_krum_deterministic(self):
+        updates = [np.array([[1.0, 2.0]], dtype=np.float32) for _ in range(4)]
+        updates += [np.array([[50.0, 50.0]], dtype=np.float32)]
+        results = []
+        for _ in range(3):
+            agg = ByzantineAggregator("krum", 0.0)
+            results.append(agg.aggregate(updates))
+        np.testing.assert_array_equal(results[0], results[1])
+        np.testing.assert_array_equal(results[1], results[2])
+
+    def test_ban_threshold(self):
+        agg = ByzantineAggregator("trimmed_mean", 0.2, ban_threshold=0.3)
+        updates = [np.array([[1.0]], dtype=np.float32) for _ in range(4)]
+        updates.append(np.array([[100.0]], dtype=np.float32))
+        ids = ["a", "b", "c", "d", "attacker"]
+        # Drive attacker reputation below threshold
+        for _ in range(5):
+            agg.aggregate(updates, client_ids=ids)
+        assert agg.get_reputation("attacker") < 0.3
+
+    def test_decay_reputations(self):
+        agg = ByzantineAggregator("trimmed_mean", 0.2)
+        updates = [np.array([[1.0]], dtype=np.float32) for _ in range(4)]
+        updates.append(np.array([[100.0]], dtype=np.float32))
+        ids = ["a", "b", "c", "d", "attacker"]
+        agg.aggregate(updates, client_ids=ids)
+        before = agg.get_reputation("attacker")
+        agg.decay_reputations(0.5)
+        after = agg.get_reputation("attacker")
+        assert after > before, "Decay should move penalized client toward 0.5"
 
     def test_invalid_method_raises(self):
         with pytest.raises(ValueError, match="Unknown method"):

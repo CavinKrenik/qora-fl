@@ -51,8 +51,27 @@ mod python {
             "trimmed_mean" => Ok(AggregationMethod::TrimmedMean),
             "median" => Ok(AggregationMethod::Median),
             "fedavg" => Ok(AggregationMethod::FedAvg),
+            s if s.starts_with("krum") => {
+                // Accept "krum" (default f=1) or "krum:N" for custom f
+                let f = if s == "krum" {
+                    1
+                } else if let Some(n) = s.strip_prefix("krum:") {
+                    n.parse::<usize>().map_err(|_| {
+                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                            "Invalid krum parameter '{}'. Use 'krum' or 'krum:N'",
+                            s
+                        ))
+                    })?
+                } else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Unknown method '{}'. Use 'trimmed_mean', 'median', 'fedavg', or 'krum[:N]'",
+                        method
+                    )));
+                };
+                Ok(AggregationMethod::Krum(f))
+            }
             _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Unknown method '{}'. Use 'trimmed_mean', 'median', or 'fedavg'",
+                "Unknown method '{}'. Use 'trimmed_mean', 'median', 'fedavg', or 'krum[:N]'",
                 method
             ))),
         }
@@ -78,11 +97,19 @@ mod python {
     #[pymethods]
     impl PyByzantineAggregator {
         #[new]
-        fn new(method: String, trim_fraction: f32) -> PyResult<Self> {
+        #[pyo3(signature = (method, trim_fraction, ban_threshold=0.0))]
+        fn new(method: String, trim_fraction: f32, ban_threshold: f32) -> PyResult<Self> {
             let agg_method = parse_method(&method)?;
-            Ok(Self {
-                inner: crate::ByzantineAggregator::new(agg_method, trim_fraction),
-            })
+            let inner = if ban_threshold > 0.0 {
+                crate::ByzantineAggregator::with_ban_threshold(
+                    agg_method,
+                    trim_fraction,
+                    ban_threshold,
+                )
+            } else {
+                crate::ByzantineAggregator::new(agg_method, trim_fraction)
+            };
+            Ok(Self { inner })
         }
 
         /// Aggregate client model updates using the configured method.
@@ -121,6 +148,17 @@ mod python {
         /// Reset all reputation scores.
         fn reset_reputation(&mut self) {
             self.inner.reset_reputation();
+        }
+
+        /// Decay all reputation scores toward 0.5 (default).
+        ///
+        /// Call once per round to allow penalized clients to recover.
+        ///
+        /// Args:
+        ///     rate: Decay rate in (0.0, 1.0). Typical: 0.01-0.05.
+        #[pyo3(signature = (rate=0.02))]
+        fn decay_reputations(&mut self, rate: f32) {
+            self.inner.decay_reputations(rate);
         }
 
         /// Serialize aggregator state to JSON for persistence.

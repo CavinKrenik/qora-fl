@@ -1,9 +1,31 @@
 //! Reputation Tracking for Sybil Resistance
 //!
-//! Provides a `ReputationTracker` that maintains trust scores per client.
+//! Provides a [`ReputationTracker`] that maintains trust scores per client.
 //! Scores increase with valid contributions and decrease when drift
 //! is detected during aggregation. Used to weight clients in
 //! Byzantine-tolerant aggregation.
+//!
+//! # Influence Formula: `min(rep^3, 0.8)`
+//!
+//! The cubic weighting `rep^3` was chosen over linear or quadratic schemes for
+//! two empirical reasons observed during the 181-day QRES deployment:
+//!
+//! 1. **Separation**: Cubic weighting amplifies the gap between honest (R≈0.7-1.0)
+//!    and marginal (R≈0.3-0.5) clients. At R=0.5, influence is only 0.125 (12.5%
+//!    of maximum), providing strong suppression of uncertain participants without
+//!    fully excluding them. Linear weighting at R=0.5 gives 0.5 (50%), which is
+//!    too permissive for adversarial settings.
+//!
+//! 2. **Stability**: Higher-order polynomials (quartic, quintic) were tested but
+//!    created brittle cliff effects where small score changes caused large influence
+//!    swings. Cubic provides a smooth gradient that is steep enough for security
+//!    but forgiving enough for clients recovering from transient faults.
+//!
+//! The 0.8 cap (INFLUENCE_CAP) bounds any single node's contribution even at R=1.0,
+//! preventing the "Slander-Amplification" vulnerability where a coalition of
+//! high-reputation nodes could dominate consensus and collectively penalize honest
+//! newcomers. With the cap, a coalition needs >80% of total weight to control the
+//! outcome, which requires many colluding high-reputation nodes rather than just one.
 
 use std::collections::BTreeMap;
 
@@ -135,6 +157,34 @@ impl ReputationTracker {
     /// Each weight is min(rep^3, INFLUENCE_CAP).
     pub fn get_influence_weights(&self, peers: &[PeerId]) -> Vec<f32> {
         peers.iter().map(|p| self.influence_weight(p)).collect()
+    }
+
+    /// Apply reputation decay toward the default trust score.
+    ///
+    /// Each call moves all scores toward `DEFAULT_TRUST` (0.5) by `rate`.
+    /// Call once per aggregation round to model temporal forgiveness:
+    /// old clients gradually return to neutral, and penalized clients
+    /// can recover over time.
+    ///
+    /// # Arguments
+    ///
+    /// * `rate` - Decay rate in (0.0, 1.0). Typical: 0.01-0.05 per round.
+    ///   `score = score + rate * (DEFAULT_TRUST - score)`
+    pub fn decay_toward_default(&mut self, rate: f32) {
+        let rate = rate.clamp(0.0, 1.0);
+        for score in self.scores.values_mut() {
+            *score += rate * (DEFAULT_TRUST - *score);
+        }
+    }
+
+    /// Remove peers that have been inactive (not updated) and whose score
+    /// has decayed back to approximately the default. Useful for cleaning
+    /// up stale entries from clients that have left the federation.
+    ///
+    /// Removes peers whose score is within `epsilon` of `DEFAULT_TRUST`.
+    pub fn prune_default_peers(&mut self, epsilon: f32) {
+        self.scores
+            .retain(|_, score| (*score - DEFAULT_TRUST).abs() > epsilon);
     }
 
     /// Compute influence weight in I16F16-compatible fixed-point representation.

@@ -54,11 +54,15 @@ class QoraStrategy(FedAvg):
     Parameters
     ----------
     aggregation_method : str
-        One of "trimmed_mean", "median", or "fedavg". Default "trimmed_mean".
+        One of "trimmed_mean", "median", "fedavg", "krum", or "krum:N".
+        Default "trimmed_mean".
     trim_fraction : float
         Fraction to trim from each end (only for trimmed_mean). Default 0.2.
     reputation_threshold : float
         Clients below this score are excluded from aggregation. Default 0.2.
+    reputation_decay_rate : float
+        Per-round decay rate toward default (0.5). 0.0 disables decay.
+        Typical: 0.01-0.05. Default 0.0.
     **kwargs
         Additional arguments passed to ``flwr.server.strategy.FedAvg``
         (fraction_fit, min_fit_clients, initial_parameters, etc.)
@@ -69,11 +73,15 @@ class QoraStrategy(FedAvg):
         aggregation_method: str = "trimmed_mean",
         trim_fraction: float = 0.2,
         reputation_threshold: float = 0.2,
+        reputation_decay_rate: float = 0.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.aggregator = ByzantineAggregator(aggregation_method, trim_fraction)
+        self.aggregator = ByzantineAggregator(
+            aggregation_method, trim_fraction, ban_threshold=reputation_threshold
+        )
         self.reputation_threshold = reputation_threshold
+        self.reputation_decay_rate = reputation_decay_rate
 
     def aggregate_fit(
         self,
@@ -142,6 +150,10 @@ class QoraStrategy(FedAvg):
         if self.fit_metrics_aggregation_fn:
             fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
             metrics.update(self.fit_metrics_aggregation_fn(fit_metrics))
+
+        # Apply reputation decay at end of round (if configured)
+        if self.reputation_decay_rate > 0:
+            self.aggregator.decay_reputations(self.reputation_decay_rate)
 
         return parameters_aggregated, metrics
 

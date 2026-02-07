@@ -105,8 +105,12 @@ fn test_all_methods_agree_on_honest_data() {
     let med = median(&updates).unwrap();
     let avg = fedavg(&updates, None).unwrap();
 
+    // Krum via ByzantineAggregator (selects one vector, so it's one of the inputs)
+    let mut krum_agg = ByzantineAggregator::new(AggregationMethod::Krum(1), 0.0);
+    let krum = krum_agg.aggregate(&updates, None).unwrap();
+
     // All should be close to [1.0, 2.0]
-    for result in &[&tm, &med, &avg] {
+    for result in &[&tm, &med, &avg, &krum] {
         assert!(
             (result[[0, 0]] - 1.0).abs() < 0.15,
             "Method disagrees on param 0: {}",
@@ -598,5 +602,340 @@ fn test_influence_cap_at_0_8() {
         (fixed - 52428).abs() <= 1,
         "Fixed-point influence at R=1.0 should be ~52428, got {}",
         fixed
+    );
+}
+
+// ===== Phase 3: Krum via ByzantineAggregator + Determinism =====
+
+#[test]
+fn test_krum_via_byzantine_aggregator() {
+    // Test Krum through the high-level API (f32 <-> I16F16 bridge)
+    let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(1), 0.0);
+
+    let updates = vec![
+        array![[1.0, 2.0]],
+        array![[1.1, 2.1]],
+        array![[0.9, 1.9]],
+        array![[1.05, 2.05]],
+        array![[50.0, 50.0]], // Byzantine
+    ];
+
+    let result = agg.aggregate(&updates, None).unwrap();
+    // Should select an honest vector, not the Byzantine one
+    assert!(
+        result[[0, 0]] < 2.0,
+        "Krum via ByzantineAggregator should select honest vector, got {}",
+        result[[0, 0]]
+    );
+}
+
+#[test]
+fn test_krum_via_aggregator_with_reputation() {
+    let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(1), 0.0);
+
+    let updates = vec![
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[100.0]], // Byzantine
+    ];
+    let ids = vec![
+        "a".to_string(),
+        "b".to_string(),
+        "c".to_string(),
+        "d".to_string(),
+        "attacker".to_string(),
+    ];
+
+    let _ = agg.aggregate(&updates, Some(&ids)).unwrap();
+
+    // Krum selects one honest vector. The selected vector has distance 0
+    // from the result, so it gets a reward. The attacker is far away -> penalized.
+    assert!(
+        agg.get_reputation("attacker") < agg.get_reputation("a"),
+        "Attacker should have lower reputation"
+    );
+}
+
+#[test]
+fn test_krum_determinism_cross_invocation() {
+    // Determinism: same inputs -> same output across separate aggregator instances
+    let updates = vec![
+        array![[1.0, 2.0, 3.0]],
+        array![[1.1, 2.1, 3.1]],
+        array![[0.9, 1.9, 2.9]],
+        array![[1.05, 2.05, 3.05]],
+        array![[50.0, 50.0, 50.0]],
+    ];
+
+    let mut results = Vec::new();
+    for _ in 0..5 {
+        let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(1), 0.0);
+        results.push(agg.aggregate(&updates, None).unwrap());
+    }
+
+    for r in &results[1..] {
+        assert_eq!(
+            &results[0], r,
+            "Krum must produce identical results across invocations"
+        );
+    }
+}
+
+#[test]
+fn test_krum_multidimensional_via_aggregator() {
+    let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(1), 0.0);
+
+    // 3x2 updates
+    let honest = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+    let updates = vec![
+        honest.clone(),
+        array![[1.1, 2.1], [3.1, 4.1], [5.1, 6.1]],
+        array![[0.9, 1.9], [2.9, 3.9], [4.9, 5.9]],
+        array![[1.05, 2.05], [3.05, 4.05], [5.05, 6.05]],
+        array![[99.0, 99.0], [99.0, 99.0], [99.0, 99.0]], // Byzantine
+    ];
+
+    let result = agg.aggregate(&updates, None).unwrap();
+    assert_eq!(result.dim(), (3, 2), "Shape should be preserved");
+    assert!(
+        result[[0, 0]] < 2.0,
+        "Should select honest vector, got {}",
+        result[[0, 0]]
+    );
+}
+
+#[test]
+fn test_reputation_decay_toward_default() {
+    let mut agg = ByzantineAggregator::new(AggregationMethod::TrimmedMean, 0.2);
+
+    // Setup: penalize a client to low reputation
+    let updates = vec![
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[100.0]], // Byzantine
+    ];
+    let ids = vec![
+        "a".to_string(),
+        "b".to_string(),
+        "c".to_string(),
+        "d".to_string(),
+        "attacker".to_string(),
+    ];
+    let _ = agg.aggregate(&updates, Some(&ids)).unwrap();
+
+    let before_decay = agg.get_reputation("attacker");
+    assert!(before_decay < 0.5, "Attacker should be penalized");
+
+    // Apply decay toward 0.5
+    for _ in 0..10 {
+        agg.decay_reputations(0.1);
+    }
+
+    let after_decay = agg.get_reputation("attacker");
+    assert!(
+        after_decay > before_decay,
+        "Decay should move penalized client toward 0.5: {} -> {}",
+        before_decay,
+        after_decay
+    );
+    assert!(
+        (after_decay - 0.5).abs() < 0.1,
+        "After significant decay, score should be near 0.5, got {}",
+        after_decay
+    );
+}
+
+#[test]
+fn test_reputation_decay_high_score() {
+    let mut agg = ByzantineAggregator::new(AggregationMethod::TrimmedMean, 0.2);
+
+    // Boost a client to high reputation
+    let updates = vec![
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[100.0]],
+    ];
+    let ids = vec![
+        "good".to_string(),
+        "b".to_string(),
+        "c".to_string(),
+        "d".to_string(),
+        "e".to_string(),
+    ];
+    // Run multiple rounds to boost "good" client reputation
+    for _ in 0..10 {
+        let _ = agg.aggregate(&updates, Some(&ids)).unwrap();
+    }
+
+    let before = agg.get_reputation("good");
+    assert!(before > 0.5, "Good client should have high rep: {}", before);
+
+    for _ in 0..20 {
+        agg.decay_reputations(0.1);
+    }
+
+    let after = agg.get_reputation("good");
+    assert!(
+        after < before,
+        "Decay should move high-rep client toward 0.5: {} -> {}",
+        before,
+        after
+    );
+}
+
+#[test]
+fn test_ban_gating_excludes_bad_clients() {
+    // Use trimmed_mean to build accurate reputations (robust against attacker).
+    // Then verify that ban gating actually excludes low-reputation clients.
+    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::TrimmedMean, 0.2, 0.3);
+
+    let updates = vec![
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[100.0]], // Byzantine
+    ];
+    let ids = vec![
+        "a".to_string(),
+        "b".to_string(),
+        "c".to_string(),
+        "d".to_string(),
+        "attacker".to_string(),
+    ];
+
+    // Run several rounds to drive attacker reputation below ban threshold.
+    // Trimmed mean gives ~1.0, so attacker (100.0) has distance ~99 → penalized each round.
+    for _ in 0..5 {
+        let _ = agg.aggregate(&updates, Some(&ids)).unwrap();
+    }
+
+    assert!(
+        agg.get_reputation("attacker") < 0.3,
+        "Attacker should be below ban threshold: {}",
+        agg.get_reputation("attacker")
+    );
+    assert!(
+        agg.get_reputation("a") >= 0.3,
+        "Honest client should be above ban threshold: {}",
+        agg.get_reputation("a")
+    );
+
+    // Now the attacker is banned -- only honest clients participate
+    let result = agg.aggregate(&updates, Some(&ids)).unwrap();
+    assert!(
+        (result[[0, 0]] - 1.0).abs() < 0.01,
+        "With attacker banned, aggregation of honest clients should be ~1.0, got {}",
+        result[[0, 0]]
+    );
+}
+
+#[test]
+fn test_ban_gating_fail_open() {
+    // If ALL clients would be banned, should use all (fail-open)
+    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::FedAvg, 0.0, 0.99);
+
+    // No one has reputation >= 0.99, so ban gating would exclude everyone
+    let updates = vec![array![[1.0]], array![[2.0]], array![[3.0]]];
+    let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+    let result = agg.aggregate(&updates, Some(&ids)).unwrap();
+    // Fail-open: all clients used
+    assert!(
+        (result[[0, 0]] - 2.0).abs() < 1e-6,
+        "Fail-open should use all clients"
+    );
+}
+
+#[test]
+fn test_reputation_tracker_decay() {
+    use qora_fl::reputation::ReputationTracker;
+
+    let mut tracker = ReputationTracker::new();
+    let peer = {
+        let mut p = [0u8; 32];
+        p[0] = 1;
+        p
+    };
+
+    // Penalize to 0.1
+    for _ in 0..5 {
+        tracker.penalize_drift(&peer);
+    }
+    // 0.5 - 5*0.08 = 0.10
+    assert!((tracker.get_score(&peer) - 0.10).abs() < 0.01);
+
+    // Decay back toward 0.5
+    for _ in 0..50 {
+        tracker.decay_toward_default(0.1);
+    }
+    assert!(
+        (tracker.get_score(&peer) - 0.5).abs() < 0.01,
+        "After sufficient decay, should be near 0.5, got {}",
+        tracker.get_score(&peer)
+    );
+}
+
+#[test]
+fn test_reputation_tracker_prune() {
+    use qora_fl::reputation::ReputationTracker;
+
+    let mut tracker = ReputationTracker::new();
+    let peer1 = {
+        let mut p = [0u8; 32];
+        p[0] = 1;
+        p
+    };
+    let peer2 = {
+        let mut p = [0u8; 32];
+        p[0] = 2;
+        p
+    };
+
+    // peer1 gets rewarded (deviates from default)
+    tracker.reward_valid_zkp(&peer1);
+    // peer2 has no activity but gets a tiny bump then decays back
+    tracker.reward_valid_zkp(&peer2);
+    for _ in 0..50 {
+        tracker.decay_toward_default(0.1);
+    }
+
+    // peer2 should be near default, peer1 also near default after decay
+    tracker.prune_default_peers(0.01);
+    assert_eq!(
+        tracker.peer_count(),
+        0,
+        "Both peers should be pruned after heavy decay"
+    );
+}
+
+#[test]
+fn test_krum_serde_roundtrip() {
+    let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(2), 0.0);
+
+    let updates = vec![
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[100.0]],
+    ];
+    let ids: Vec<String> = (0..7).map(|i| format!("c{}", i)).collect();
+    let _ = agg.aggregate(&updates, Some(&ids)).unwrap();
+
+    let json = serde_json::to_string(&agg).expect("serialize");
+    let restored: ByzantineAggregator = serde_json::from_str(&json).expect("deserialize");
+
+    assert!(
+        (restored.get_reputation("c0") - agg.get_reputation("c0")).abs() < 1e-6,
+        "Reputation should survive round-trip"
     );
 }

@@ -215,8 +215,7 @@ mod python {
         #[staticmethod]
         #[pyo3(signature = (json_str, ban_threshold=0.2))]
         fn from_json(json_str: &str, ban_threshold: f32) -> PyResult<Self> {
-            let scores: HashMap<String, f32> =
-                serde_json::from_str(json_str).map_err(json_err)?;
+            let scores: HashMap<String, f32> = serde_json::from_str(json_str).map_err(json_err)?;
             Ok(Self {
                 scores,
                 ban_threshold,

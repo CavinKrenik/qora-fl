@@ -9,9 +9,7 @@ fn bench_aggregation(c: &mut Criterion) {
         for &n_params in &[1_000usize, 100_000, 1_000_000] {
             let updates: Vec<Array2<f32>> = (0..n_clients)
                 .map(|i| {
-                    Array2::from_shape_fn((1, n_params), |(_, j)| {
-                        ((i * n_params + j) as f32).sin()
-                    })
+                    Array2::from_shape_fn((1, n_params), |(_, j)| ((i * n_params + j) as f32).sin())
                 })
                 .collect();
 
@@ -23,17 +21,13 @@ fn bench_aggregation(c: &mut Criterion) {
                 |b, updates| b.iter(|| trimmed_mean(updates, 0.2).unwrap()),
             );
 
-            group.bench_with_input(
-                BenchmarkId::new("median", &id),
-                &updates,
-                |b, updates| b.iter(|| median(updates).unwrap()),
-            );
+            group.bench_with_input(BenchmarkId::new("median", &id), &updates, |b, updates| {
+                b.iter(|| median(updates).unwrap())
+            });
 
-            group.bench_with_input(
-                BenchmarkId::new("fedavg", &id),
-                &updates,
-                |b, updates| b.iter(|| fedavg(updates, None).unwrap()),
-            );
+            group.bench_with_input(BenchmarkId::new("fedavg", &id), &updates, |b, updates| {
+                b.iter(|| fedavg(updates, None).unwrap())
+            });
         }
     }
     group.finish();

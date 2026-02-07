@@ -45,8 +45,8 @@ Clients produce model updates
 │                           │
 │  ┌─────────────────────┐  │
 │  │ Trimmed Mean (~30%) │  │
-│  │ Median      (~50%) │  │
-│  │ Krum   (n ≥ 2f+3)  │  │
+│  │ Median      (~50%)  │  │
+│  │ Krum   (n ≥ 2f+3)   │  │ 
 │  │ FedAvg  (baseline)  │  │
 │  └─────────────────────┘  │
 └─────────────┬─────────────┘
@@ -55,11 +55,11 @@ Clients produce model updates
               │
               ▼
      ┌─────────────────┐
-     │    Reputation    │
-     │     Manager      │
-     │                  │
-     │  Scores / Gates  │
-     │  / Weighting     │
+     │    Reputation   │
+     │     Manager     │
+     │                 │
+     │  Scores / Gates │
+     │  / Weighting    │
      └────────┬────────┘
               │
               ▼

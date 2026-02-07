@@ -64,10 +64,10 @@ jobs:
         rep = ReputationManager(ban_threshold=0.2)
         rep.reward('a', 0.1)
         rep.penalize('b', 0.4)
-        assert rep.get_score('a') == 0.6
+        assert abs(rep.get_score('a') - 0.6) < 1e-6, f'expected ~0.6, got {rep.get_score(\"a\")}'
         assert rep.is_banned('b')
         json_str = rep.to_json()
         rep2 = ReputationManager.from_json(json_str, ban_threshold=0.2)
-        assert rep2.get_score('a') == 0.6
+        assert abs(rep2.get_score('a') - 0.6) < 1e-6
         print('ReputationManager OK')
         "

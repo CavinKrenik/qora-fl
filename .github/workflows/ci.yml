@@ -31,6 +31,26 @@ jobs:
         cargo run --example quickstart
         cargo run --example compare_methods
 
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: llvm-tools-preview
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Generate coverage
+      run: cargo llvm-cov --lcov --output-path lcov.info
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        files: lcov.info
+        fail_ci_if_error: false
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
   python:
     name: Python bindings
     runs-on: ubuntu-latest
@@ -40,40 +60,19 @@ jobs:
     - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    - name: Setup venv and install maturin
+    - name: Install dependencies
       run: |
         python -m venv .venv
         source .venv/bin/activate
-        pip install maturin
+        pip install maturin pytest numpy
       working-directory: bindings/python
-    - name: Build and install Python package
+    - name: Build Python package
       run: |
         source .venv/bin/activate
         maturin develop --features python
       working-directory: bindings/python
-    - name: Test Python imports
+    - name: Run pytest
       working-directory: bindings/python
       run: |
         source .venv/bin/activate
-        python -c "from qora import ByzantineAggregator, ReputationManager; print('imports OK')"
-        python -c "
-        import numpy as np
-        from qora import ByzantineAggregator
-        agg = ByzantineAggregator('trimmed_mean', 0.2)
-        updates = [np.array([[1.0, 2.0]], dtype=np.float32) for _ in range(5)]
-        result = agg.aggregate(updates)
-        assert result.shape == (1, 2), f'unexpected shape: {result.shape}'
-        print('aggregation OK')
-        "
-        python -c "
-        from qora import ReputationManager
-        rep = ReputationManager(ban_threshold=0.2)
-        rep.reward('a', 0.1)
-        rep.penalize('b', 0.4)
-        assert abs(rep.get_score('a') - 0.6) < 1e-6, f'expected ~0.6, got {rep.get_score(\"a\")}'
-        assert rep.is_banned('b')
-        json_str = rep.to_json()
-        rep2 = ReputationManager.from_json(json_str, ban_threshold=0.2)
-        assert abs(rep2.get_score('a') - 0.6) < 1e-6
-        print('ReputationManager OK')
-        "
+        pytest tests/ -v

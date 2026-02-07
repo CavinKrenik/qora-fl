@@ -4,7 +4,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/qora-fl.svg)](https://crates.io/crates/qora-fl)
 [![PyPI](https://img.shields.io/pypi/v/qora-fl.svg)](https://pypi.org/project/qora-fl/)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18513738.svg)](https://doi.org/10.5281/zenodo.18513738)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.18513738-blue)](https://doi.org/10.5281/zenodo.18513738)
 [![License](https://img.shields.io/crates/l/qora-fl.svg)](LICENSE-MIT)
 
 ## Problem

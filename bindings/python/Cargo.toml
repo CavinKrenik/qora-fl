@@ -1,0 +1,2 @@
+# This tells maturin to use the root Cargo.toml
+# No content needed - just a marker file

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "qora-fl"
+version = "0.2.0"
+description = "Qora: Quorum-Oriented Robust Aggregation for Federated Learning"
+readme = "../../README.md"
+requires-python = ">=3.8"
+authors = [{name = "Cavin Krenik", email = "cavinkrenik5@icloud.com"}]
+license = {text = "MIT OR Apache-2.0"}
+keywords = ["federated-learning", "byzantine-tolerance", "machine-learning"]
+
+dependencies = [
+    "numpy>=1.21.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/CavinKrenik/qora-fl"
+Repository = "https://github.com/CavinKrenik/qora-fl"
+
+[tool.maturin]
+manifest-path = "../../Cargo.toml"
+python-source = "."
+module-name = "qora._core"
+features = ["python"]

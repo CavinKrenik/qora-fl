@@ -61,6 +61,20 @@ let med = median(&updates).unwrap();
 let avg = fedavg(&updates, None).unwrap();
 ```
 
+## Examples
+
+### Quickstart
+```bash
+cargo run --example quickstart
+```
+
+### Compare Methods
+```bash
+cargo run --example compare_methods
+```
+
+See [examples/](examples/) for more.
+
 ## Background
 
 Core algorithms validated in [QRES](https://github.com/CavinKrenik/RaaS) (181-day autonomous IoT deployment with 30% Byzantine tolerance). Qora-FL adapts this proven consensus to standard federated learning workflows.

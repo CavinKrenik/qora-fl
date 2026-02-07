@@ -17,10 +17,7 @@ use crate::error::QoraError;
 ///
 /// * `updates` - Client model updates as 2D arrays (one per client)
 /// * `weights` - Optional client weights (e.g., proportional to dataset size)
-pub fn fedavg(
-    updates: &[Array2<f32>],
-    weights: Option<&[f32]>,
-) -> Result<Array2<f32>, QoraError> {
+pub fn fedavg(updates: &[Array2<f32>], weights: Option<&[f32]>) -> Result<Array2<f32>, QoraError> {
     if updates.is_empty() {
         return Err(QoraError::EmptyUpdates);
     }
@@ -44,10 +41,12 @@ pub fn fedavg(
                     actual: 0,
                 });
             }
-            let weighted_sum = updates.iter().zip(w.iter()).fold(
-                Array2::<f32>::zeros(dim),
-                |acc, (update, &weight)| acc + &(update * weight),
-            );
+            let weighted_sum = updates
+                .iter()
+                .zip(w.iter())
+                .fold(Array2::<f32>::zeros(dim), |acc, (update, &weight)| {
+                    acc + &(update * weight)
+                });
             Ok(weighted_sum / weight_sum)
         }
         None => {
@@ -91,7 +90,10 @@ mod tests {
         ];
         let result = fedavg(&updates, None).unwrap();
         // FedAvg is corrupted: (1 + 1 + 100) / 3 = 34.0
-        assert!(result[[0, 0]] > 10.0, "FedAvg should be corrupted by attacker");
+        assert!(
+            result[[0, 0]] > 10.0,
+            "FedAvg should be corrupted by attacker"
+        );
     }
 
     #[test]

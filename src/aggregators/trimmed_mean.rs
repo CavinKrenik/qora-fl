@@ -29,10 +29,7 @@ use crate::error::QoraError;
 /// Weights are intentionally not supported here because sorting destroys the
 /// correspondence between values and their original client weights. Use
 /// [`super::fedavg`] for weighted aggregation without Byzantine tolerance.
-pub fn trimmed_mean(
-    updates: &[Array2<f32>],
-    trim_fraction: f32,
-) -> Result<Array2<f32>, QoraError> {
+pub fn trimmed_mean(updates: &[Array2<f32>], trim_fraction: f32) -> Result<Array2<f32>, QoraError> {
     if updates.is_empty() {
         return Err(QoraError::EmptyUpdates);
     }
@@ -69,10 +66,7 @@ pub fn trimmed_mean(
             let row = param_idx / ncols;
             let col = param_idx % ncols;
 
-            let mut values: Vec<f32> = updates
-                .iter()
-                .map(|update| update[[row, col]])
-                .collect();
+            let mut values: Vec<f32> = updates.iter().map(|update| update[[row, col]]).collect();
 
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -91,11 +85,7 @@ mod tests {
 
     #[test]
     fn test_honest_clients_only() {
-        let updates = vec![
-            array![[1.0, 2.0]],
-            array![[1.0, 2.0]],
-            array![[1.0, 2.0]],
-        ];
+        let updates = vec![array![[1.0, 2.0]], array![[1.0, 2.0]], array![[1.0, 2.0]]];
         let result = trimmed_mean(&updates, 0.2).unwrap();
         assert!((result[[0, 0]] - 1.0).abs() < 1e-6);
         assert!((result[[0, 1]] - 2.0).abs() < 1e-6);

@@ -42,10 +42,7 @@ pub fn median(updates: &[Array2<f32>]) -> Result<Array2<f32>, QoraError> {
             let row = param_idx / ncols;
             let col = param_idx % ncols;
 
-            let mut values: Vec<f32> = updates
-                .iter()
-                .map(|update| update[[row, col]])
-                .collect();
+            let mut values: Vec<f32> = updates.iter().map(|update| update[[row, col]]).collect();
 
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -75,12 +72,7 @@ mod tests {
 
     #[test]
     fn test_median_even_count() {
-        let updates = vec![
-            array![[1.0]],
-            array![[2.0]],
-            array![[3.0]],
-            array![[4.0]],
-        ];
+        let updates = vec![array![[1.0]], array![[2.0]], array![[3.0]], array![[4.0]]];
         let result = median(&updates).unwrap();
         assert_eq!(result[[0, 0]], 2.5);
     }
@@ -99,15 +91,18 @@ mod tests {
     #[test]
     fn test_median_30_percent_byzantine() {
         // 7 honest (~1.0), 3 Byzantine (100.0)
-        let mut updates: Vec<Array2<f32>> = (0..7)
-            .map(|i| array![[1.0 + i as f32 * 0.1]])
-            .collect();
+        let mut updates: Vec<Array2<f32>> =
+            (0..7).map(|i| array![[1.0 + i as f32 * 0.1]]).collect();
         updates.extend(vec![array![[100.0]]; 3]);
 
         let result = median(&updates).unwrap();
         // Median of sorted [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 100, 100, 100]
         // mid=5, values[4]=1.4, values[5]=1.5 -> median = 1.45
-        assert!(result[[0, 0]] < 2.0, "Expected <2.0, got {}", result[[0, 0]]);
+        assert!(
+            result[[0, 0]] < 2.0,
+            "Expected <2.0, got {}",
+            result[[0, 0]]
+        );
     }
 
     #[test]

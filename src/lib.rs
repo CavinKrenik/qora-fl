@@ -24,10 +24,10 @@ pub mod reputation;
 pub mod verification;
 
 // Re-exports
-pub use aggregators::trimmed_mean;
-pub use aggregators::median;
-pub use aggregators::fedavg;
 pub use aggregators::aggregate_krum;
+pub use aggregators::fedavg;
+pub use aggregators::median;
+pub use aggregators::trimmed_mean;
 pub use aggregators::{AggregationMethod, ByzantineAggregator};
 pub use error::QoraError;
 pub use reputation::ReputationTracker;

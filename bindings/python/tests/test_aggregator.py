@@ -7,7 +7,6 @@ import pytest
 
 from qora import ByzantineAggregator, ReputationManager
 
-
 # --- ByzantineAggregator ---
 
 
@@ -144,7 +143,10 @@ class TestByzantineAggregator:
 
         # Verify restored aggregator preserves reputation
         assert abs(restored.get_reputation("a") - agg.get_reputation("a")) < 1e-6
-        assert abs(restored.get_reputation("attacker") - agg.get_reputation("attacker")) < 1e-6
+        assert (
+            abs(restored.get_reputation("attacker") - agg.get_reputation("attacker"))
+            < 1e-6
+        )
 
     def test_multidimensional_input(self):
         agg = ByzantineAggregator("trimmed_mean", 0.2)
@@ -225,7 +227,9 @@ class TestReputationManager:
         rep2 = ReputationManager.from_json(json_str, ban_threshold=0.2)
 
         assert abs(rep2.get_score("hospital_A") - rep.get_score("hospital_A")) < 1e-6
-        assert abs(rep2.get_score("hospital_bad") - rep.get_score("hospital_bad")) < 1e-6
+        assert (
+            abs(rep2.get_score("hospital_bad") - rep.get_score("hospital_bad")) < 1e-6
+        )
         assert rep2.is_banned("hospital_bad") == rep.is_banned("hospital_bad")
 
     def test_json_is_valid(self):

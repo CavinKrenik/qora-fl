@@ -21,14 +21,14 @@ Qora-FL is designed as **infrastructure**, emphasizing:
 
 - **Explicit aggregation semantics** -- each method has documented tolerance bounds, not just "robust"
 - **Measurable deviation signals** -- reputation is derived from observable behavior, not assumed trust
-- **Deterministic execution paths** -- Q16.16 fixed-point option for bit-perfect reproducibility
+- **Deterministic execution paths** -- BFP-16 block floating-point for deterministic Krum/Multi-Krum distance computation
 - **Ecosystem integration** -- drop-in Flower strategy, not a standalone experiment
 - **Benchmarked overhead** -- sub-10ms aggregation for 100K parameters, not just accuracy claims
 
 | Feature | FedAvg | Typical Robust FL | Qora-FL |
 |---------|--------|-------------------|---------|
 | Byzantine tolerance | -- | Paper-only | Algorithms informed by 181-day QRES deployment |
-| Deterministic option | -- | -- | Q16.16 fixed-point |
+| Deterministic option | -- | -- | BFP-16 block floating-point |
 | Reputation tracking | -- | -- | Deviation-derived, persistent |
 | Flower integration | Native | -- | Drop-in `QoraStrategy` |
 | Benchmarked overhead | -- | -- | <10ms / 100K params |
@@ -40,16 +40,17 @@ Qora-FL is designed as **infrastructure**, emphasizing:
 Clients produce model updates
         │
         ▼
-┌───────────────────────────┐
-│   Qora Robust Aggregator  │
-│                           │
-│  ┌─────────────────────┐  │
-│  │ Trimmed Mean (~30%) │  │
-│  │ Median      (~50%)  │  │
-│  │ Krum   (n ≥ 2f+3)   │  │
-│  │ FedAvg  (baseline)  │  │
-│  └─────────────────────┘  │
-└─────────────┬─────────────┘
+┌────────────────────────────────┐
+│   Qora Robust Aggregator       │
+│                                │
+│  ┌──────────────────────────┐  │
+│  │ Trimmed Mean    (~30%)   │  │
+│  │ Median          (~50%)   │  │
+│  │ Krum       (n ≥ 2f+3)    │  │
+│  │ Multi-Krum  (top-m avg)  │  │
+│  │ FedAvg      (baseline)   │  │
+│  └──────────────────────────┘  │
+└─────────────┬──────────────────┘
               │
    Deviation signal (not trust)
               │
@@ -69,13 +70,13 @@ Clients produce model updates
 ## Determinism & Reproducibility
 
 Floating-point aggregation is not reproducible across platforms or runtimes.
-Qora-FL optionally supports **deterministic aggregation paths** via Q16.16 (I16F16) fixed-point arithmetic, enabling:
+Qora-FL supports **deterministic aggregation paths** via BFP-16 (block floating-point with 16-bit mantissas and per-vector shared exponent), enabling:
 
-- **Reproducible experiments** -- identical results regardless of hardware, compiler, or optimization level
+- **Reproducible experiments** -- identical Krum/Multi-Krum rankings regardless of hardware, compiler, or optimization level
 - **Auditability** -- any party can verify the exact aggregation result from the same inputs
 - **Consensus-style FL** -- bit-perfect agreement required for regulated industries (healthcare, finance)
 
-Deterministic modes trade numerical range for predictability and are explicitly surfaced in the API. The fixed-point Krum implementation was validated across ARM Cortex-M, Xtensa (ESP32), and x86_64 during the 181-day QRES deployment.
+BFP-16 extends the original Q16.16 fixed-point approach to cover the full `f32` range. Distance computations use purely integer arithmetic (i32 shifts, i64 accumulation, saturating operations). The deterministic Krum implementation was validated across ARM Cortex-M, Xtensa (ESP32), and x86_64 during the 181-day QRES deployment.
 
 ## Reputation as a First-Class Primitive
 
@@ -199,7 +200,8 @@ let avg = fedavg(&updates, None).unwrap();
 |--------|-------------------|----------|
 | `TrimmedMean` | ~30% of clients | Default choice for most FL deployments |
 | `Median` | ~50% of clients | When stronger robustness is needed |
-| `Krum` | n >= 2f+3 | Fixed-point deterministic consensus |
+| `Krum` | n >= 2f+3 | Deterministic single-vector selection |
+| `MultiKrum` | n >= 2f+3 | Top-m averaging for smoother convergence |
 | `FedAvg` | None | Baseline comparison only |
 
 ## Benchmarks
@@ -226,7 +228,7 @@ cargo run --example compare_methods
 
 ## Background
 
-The aggregation algorithms in Qora-FL (trimmed mean, coordinate-wise median, Krum) are standard Byzantine-robust aggregation methods from the federated learning literature [1][2]. The specific design decisions -- deviation-derived reputation, Q16.16 deterministic paths, and the 0.8 influence cap -- were informed by operational experience during a 181-day autonomous IoT deployment ([QRES](https://github.com/CavinKrenik/RaaS)). The Qora-FL codebase is a clean-room Rust implementation; it does not share code with the original QRES prototype.
+The aggregation algorithms in Qora-FL (trimmed mean, coordinate-wise median, Krum, Multi-Krum) are standard Byzantine-robust aggregation methods from the federated learning literature [1][2]. The specific design decisions -- deviation-derived reputation, BFP-16 deterministic paths, adaptive trim fraction, and the 0.8 influence cap -- were informed by operational experience during a 181-day autonomous IoT deployment ([QRES](https://github.com/CavinKrenik/RaaS)). The Qora-FL codebase is a clean-room Rust implementation; it does not share code with the original QRES prototype.
 
 ## Design Philosophy
 
@@ -235,9 +237,9 @@ Qora-FL treats aggregation as a **decision process**, not a statistical convenie
 ## Roadmap
 
 - Weighted robust aggregation (reputation-scaled trimmed mean)
-- Adaptive trim selection based on detected attack intensity
 - TensorFlow Federated adapter
 - Formal verification experiments for the deterministic path
+- Norm-bound verification as a pre-aggregation filter
 
 ## Requirements
 

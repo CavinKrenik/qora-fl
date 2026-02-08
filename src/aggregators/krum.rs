@@ -207,18 +207,13 @@ pub fn aggregate_krum(vectors: &[Vec<I16F16>], f: usize) -> Option<Vec<I16F16>> 
     Some(vectors[best_idx].clone())
 }
 
-/// Selects the best vector index using Krum with BFP-16 distance computation.
+/// Compute Krum scores for all vectors using BFP-16 distance.
 ///
-/// Uses [`Bfp16Vec`] block floating-point encoding for distance calculations,
-/// handling the full f32 range without the I16F16 overflow/underflow issues.
-/// The outer score loop is parallelized with rayon.
+/// Each vector's score is the sum of squared distances to its `k = n - f - 2`
+/// nearest neighbors, computed in parallel via rayon.
 ///
-/// Returns `Some(index)` of the selected vector, or `None` if n < 3.
-///
-/// # Arguments
-/// * `vectors` - BFP-16 encoded model update vectors
-/// * `f` - Maximum number of Byzantine nodes expected
-pub fn aggregate_krum_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<usize> {
+/// Returns `None` if `n < 3`.
+fn compute_krum_scores_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<Vec<(usize, i64)>> {
     let n = vectors.len();
 
     if n < 3 {
@@ -235,8 +230,7 @@ pub fn aggregate_krum_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<usize> {
 
     let k = if n > f + 2 { n - f - 2 } else { 1 };
 
-    // Parallel score computation: each vector's score is independent
-    let scores: Vec<i64> = (0..n)
+    let scores: Vec<(usize, i64)> = (0..n)
         .into_par_iter()
         .map(|i| {
             let mut distances: Vec<i64> = (0..n)
@@ -250,16 +244,49 @@ pub fn aggregate_krum_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<usize> {
             for d in distances.iter().take(k) {
                 score = score.saturating_add(*d);
             }
-            score
+            (i, score)
         })
         .collect();
 
-    // Sequential selection for deterministic tie-breaking (first minimum wins)
+    Some(scores)
+}
+
+/// Selects the best vector index using Krum with BFP-16 distance computation.
+///
+/// Uses [`Bfp16Vec`] block floating-point encoding for distance calculations,
+/// handling the full f32 range without the I16F16 overflow/underflow issues.
+/// The outer score loop is parallelized with rayon.
+///
+/// Returns `Some(index)` of the selected vector, or `None` if n < 3.
+///
+/// # Arguments
+/// * `vectors` - BFP-16 encoded model update vectors
+/// * `f` - Maximum number of Byzantine nodes expected
+pub fn aggregate_krum_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<usize> {
+    let scores = compute_krum_scores_bfp16(vectors, f)?;
     scores
         .iter()
-        .enumerate()
-        .min_by_key(|&(_, &score)| score)
-        .map(|(idx, _)| idx)
+        .min_by_key(|&&(_, score)| score)
+        .map(|&(idx, _)| idx)
+}
+
+/// Selects the top-m vectors by Krum score (Multi-Krum).
+///
+/// Returns the indices of the `m` vectors with lowest Krum scores.
+/// When `m = 1`, equivalent to single Krum. Higher `m` gives a smoother
+/// result when the selected vectors are averaged.
+///
+/// For full Byzantine tolerance, `m <= n - 2f - 2` (Blanchard et al., 2017).
+///
+/// # Arguments
+/// * `vectors` - BFP-16 encoded model update vectors
+/// * `f` - Maximum number of Byzantine nodes expected
+/// * `m` - Number of vectors to select (clamped to n)
+pub fn aggregate_multi_krum_bfp16(vectors: &[Bfp16Vec], f: usize, m: usize) -> Option<Vec<usize>> {
+    let mut scores = compute_krum_scores_bfp16(vectors, f)?;
+    scores.sort_by_key(|&(_, score)| score);
+    let m_eff = m.max(1).min(scores.len());
+    Some(scores.iter().take(m_eff).map(|&(idx, _)| idx).collect())
 }
 
 #[cfg(test)]
@@ -481,5 +508,73 @@ mod tests {
             idx, 4,
             "Should not select Byzantine vector even with large values"
         );
+    }
+
+    // ===== Multi-Krum tests =====
+
+    #[test]
+    fn test_multi_krum_m1_matches_single() {
+        let vectors: Vec<Bfp16Vec> = vec![
+            Bfp16Vec::from_f32_slice(&[1.0, 1.1]),
+            Bfp16Vec::from_f32_slice(&[0.9, 1.0]),
+            Bfp16Vec::from_f32_slice(&[1.05, 0.95]),
+            Bfp16Vec::from_f32_slice(&[1.0, 1.0]),
+            Bfp16Vec::from_f32_slice(&[100.0, 100.0]),
+        ];
+        let single = aggregate_krum_bfp16(&vectors, 1).unwrap();
+        let multi = aggregate_multi_krum_bfp16(&vectors, 1, 1).unwrap();
+        assert_eq!(multi.len(), 1);
+        assert_eq!(multi[0], single);
+    }
+
+    #[test]
+    fn test_multi_krum_selects_honest() {
+        let vectors: Vec<Bfp16Vec> = vec![
+            Bfp16Vec::from_f32_slice(&[1.0, 1.1]),
+            Bfp16Vec::from_f32_slice(&[0.9, 1.0]),
+            Bfp16Vec::from_f32_slice(&[1.05, 0.95]),
+            Bfp16Vec::from_f32_slice(&[1.0, 1.0]),
+            Bfp16Vec::from_f32_slice(&[100.0, 100.0]), // Byzantine
+        ];
+        let indices = aggregate_multi_krum_bfp16(&vectors, 1, 3).unwrap();
+        assert_eq!(indices.len(), 3);
+        assert!(!indices.contains(&4), "Should not select Byzantine vector");
+    }
+
+    #[test]
+    fn test_multi_krum_m_clamped_to_n() {
+        let vectors: Vec<Bfp16Vec> = vec![
+            Bfp16Vec::from_f32_slice(&[1.0]),
+            Bfp16Vec::from_f32_slice(&[2.0]),
+            Bfp16Vec::from_f32_slice(&[3.0]),
+        ];
+        let indices = aggregate_multi_krum_bfp16(&vectors, 0, 100).unwrap();
+        assert_eq!(indices.len(), 3, "m should be clamped to n");
+    }
+
+    #[test]
+    fn test_multi_krum_determinism() {
+        let vectors: Vec<Bfp16Vec> = vec![
+            Bfp16Vec::from_f32_slice(&[1.0, 2.0]),
+            Bfp16Vec::from_f32_slice(&[1.1, 2.1]),
+            Bfp16Vec::from_f32_slice(&[0.9, 1.9]),
+            Bfp16Vec::from_f32_slice(&[1.05, 2.05]),
+            Bfp16Vec::from_f32_slice(&[50.0, 50.0]),
+        ];
+        let r1 = aggregate_multi_krum_bfp16(&vectors, 1, 3);
+        let r2 = aggregate_multi_krum_bfp16(&vectors, 1, 3);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_multi_krum_returns_none_small_n() {
+        let empty: Vec<Bfp16Vec> = vec![];
+        assert!(aggregate_multi_krum_bfp16(&empty, 0, 1).is_none());
+
+        let two = vec![
+            Bfp16Vec::from_f32_slice(&[1.0]),
+            Bfp16Vec::from_f32_slice(&[2.0]),
+        ];
+        assert!(aggregate_multi_krum_bfp16(&two, 0, 1).is_none());
     }
 }

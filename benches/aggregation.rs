@@ -36,6 +36,18 @@ fn bench_aggregation(c: &mut Criterion) {
                     agg.aggregate(updates, None).unwrap()
                 })
             });
+
+            group.bench_with_input(
+                BenchmarkId::new("multi_krum_m3", &id),
+                &updates,
+                |b, updates| {
+                    b.iter(|| {
+                        let mut agg =
+                            ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+                        agg.aggregate(updates, None).unwrap()
+                    })
+                },
+            );
         }
     }
     group.finish();

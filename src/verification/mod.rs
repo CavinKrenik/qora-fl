@@ -1,8 +1,15 @@
-//! Verification module (planned).
+//! Verification primitives for federated learning updates.
 //!
-//! This module is reserved for future client attestation mechanisms.
-//! Planned features include lightweight proof-of-work attestation and
-//! update norm-bound verification. ZK proofs are a longer-term goal
-//! pending selection of a suitable proof system for the FL domain.
+//! Provides practical verification checks for model updates:
 //!
-//! **Current status:** Not yet implemented. See the project roadmap.
+//! - [`norm_bound`] — Reject updates with excessive L2 norm
+//! - [`krum_condition`] — Check Krum's `n >= 2f+3` requirement
+//! - [`audit`] — Append-only aggregation audit log
+
+pub mod audit;
+pub mod krum_condition;
+pub mod norm_bound;
+
+pub use audit::{AggregationAuditEntry, AuditLog};
+pub use krum_condition::{krum_condition_met, max_tolerable_f};
+pub use norm_bound::{check_norm_bound, filter_by_norm_bound};

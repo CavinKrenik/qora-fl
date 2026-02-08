@@ -1,6 +1,8 @@
 //! Reputation Tracking for Sybil Resistance
 //!
-//! Provides a [`ReputationTracker`] that maintains trust scores per client.
+//! Provides a [`ReputationTracker`] that maintains trust scores per client,
+//! backed by the generic [`ReputationStore`](store::ReputationStore).
+//!
 //! Scores increase with valid contributions and decrease when drift
 //! is detected during aggregation. Used to weight clients in
 //! Byzantine-tolerant aggregation.
@@ -27,15 +29,14 @@
 //! newcomers. With the cap, a coalition needs >80% of total weight to control the
 //! outcome, which requires many colluding high-reputation nodes rather than just one.
 
-use std::collections::BTreeMap;
+pub mod store;
+
+pub use store::ReputationStore;
 
 use serde::{Deserialize, Serialize};
 
 /// A peer identifier (32-byte public key as hex or raw bytes)
 pub type PeerId = [u8; 32];
-
-/// Default trust score for new peers
-const DEFAULT_TRUST: f32 = 0.5;
 
 /// Reward increment for valid ZKP submission
 const ZKP_REWARD: f32 = 0.02;
@@ -50,8 +51,6 @@ const ZKP_FAILURE_PENALTY: f32 = 0.15;
 const BAN_THRESHOLD: f32 = 0.2;
 
 /// Maximum influence cap factor for rep^3 weighting (mitigates Slander-Amplification).
-/// Even at R=1.0, influence is capped at rep^3 * INFLUENCE_CAP = 1.0 * 0.8 = 0.8.
-/// This prevents any single node from dominating consensus in high-Gini scenarios.
 const INFLUENCE_CAP: f32 = 0.8;
 
 /// Reputation tracker for swarm peers.
@@ -64,7 +63,8 @@ const INFLUENCE_CAP: f32 = 0.8;
 /// - Peers below 0.2 are banned from consensus
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReputationTracker {
-    scores: BTreeMap<PeerId, f32>,
+    #[serde(flatten)]
+    inner: ReputationStore<PeerId>,
 }
 
 impl Default for ReputationTracker {
@@ -77,41 +77,38 @@ impl ReputationTracker {
     /// Create a new, empty reputation tracker
     pub fn new() -> Self {
         Self {
-            scores: BTreeMap::new(),
+            inner: ReputationStore::new(),
         }
     }
 
     /// Get the trust score for a peer (default 0.5 for unknown peers)
     pub fn get_score(&self, peer: &PeerId) -> f32 {
-        self.scores.get(peer).copied().unwrap_or(DEFAULT_TRUST)
+        self.inner.get_score(peer)
     }
 
     /// Check if a peer is banned (score < BAN_THRESHOLD)
     pub fn is_banned(&self, peer: &PeerId) -> bool {
-        self.get_score(peer) < BAN_THRESHOLD
+        self.inner.is_banned(peer, BAN_THRESHOLD)
     }
 
     /// Reward a peer for submitting a valid ZKP
     pub fn reward_valid_zkp(&mut self, peer: &PeerId) {
-        let score = self.scores.entry(*peer).or_insert(DEFAULT_TRUST);
-        *score = (*score + ZKP_REWARD).min(1.0);
+        self.inner.reward(*peer, ZKP_REWARD);
     }
 
     /// Penalize a peer for drift detected during aggregation
     pub fn penalize_drift(&mut self, peer: &PeerId) {
-        let score = self.scores.entry(*peer).or_insert(DEFAULT_TRUST);
-        *score = (*score - DRIFT_PENALTY).max(0.0);
+        self.inner.penalize(*peer, DRIFT_PENALTY);
     }
 
     /// Penalize a peer for failed ZKP verification
     pub fn penalize_zkp_failure(&mut self, peer: &PeerId) {
-        let score = self.scores.entry(*peer).or_insert(DEFAULT_TRUST);
-        *score = (*score - ZKP_FAILURE_PENALTY).max(0.0);
+        self.inner.penalize(*peer, ZKP_FAILURE_PENALTY);
     }
 
     /// Get all non-banned peers and their scores
     pub fn active_peers(&self) -> Vec<(PeerId, f32)> {
-        self.scores
+        self.inner
             .iter()
             .filter(|(_, &score)| score >= BAN_THRESHOLD)
             .map(|(&peer, &score)| (peer, score))
@@ -119,89 +116,56 @@ impl ReputationTracker {
     }
 
     /// Get reputation weights for a set of peers (for weighted aggregation)
-    /// Returns weights normalized so the max is 1.0
     pub fn get_weights(&self, peers: &[PeerId]) -> Vec<f32> {
-        peers.iter().map(|p| self.get_score(p)).collect()
+        peers.iter().map(|p| self.inner.get_score(p)).collect()
     }
 
     /// Number of tracked peers
     pub fn peer_count(&self) -> usize {
-        self.scores.len()
+        self.inner.len()
     }
 
     /// Number of banned peers
     pub fn banned_count(&self) -> usize {
-        self.scores.values().filter(|&&s| s < BAN_THRESHOLD).count()
+        self.inner.count_below(BAN_THRESHOLD)
     }
 
     /// Compute the influence-capped reputation^3 weight for a peer.
     ///
-    /// Applies the cubic reputation weighting used in multimodal temporal
-    /// attention (INV-1 compliance) with an influence cap to mitigate the
-    /// "Slander-Amplification" vulnerability described in REPUTATION_PRIVACY.md.
-    ///
     /// Formula: min(rep^3, INFLUENCE_CAP)
-    ///
-    /// This ensures no single node can dominate consensus even at R=1.0,
-    /// bounding single-node contribution to 0.8 of the total weight.
-    ///
-    /// The computation uses checked multiplication to avoid overflow when
-    /// translated to I16F16 fixed-point in the consensus path.
     pub fn influence_weight(&self, peer: &PeerId) -> f32 {
-        let score = self.get_score(peer);
-        let rep_cubed = score * score * score;
-        rep_cubed.min(INFLUENCE_CAP)
+        self.inner.influence_weight(peer, INFLUENCE_CAP)
     }
 
-    /// Get influence-capped weights for a set of peers (for weighted aggregation).
-    /// Each weight is min(rep^3, INFLUENCE_CAP).
+    /// Get influence-capped weights for a set of peers.
     pub fn get_influence_weights(&self, peers: &[PeerId]) -> Vec<f32> {
-        peers.iter().map(|p| self.influence_weight(p)).collect()
+        peers
+            .iter()
+            .map(|p| self.inner.influence_weight(p, INFLUENCE_CAP))
+            .collect()
     }
 
-    /// Apply reputation decay toward the default trust score.
-    ///
-    /// Each call moves all scores toward `DEFAULT_TRUST` (0.5) by `rate`.
-    /// Call once per aggregation round to model temporal forgiveness:
-    /// old clients gradually return to neutral, and penalized clients
-    /// can recover over time.
+    /// Apply reputation decay toward the default trust score (0.5).
     ///
     /// # Arguments
-    ///
     /// * `rate` - Decay rate in (0.0, 1.0). Typical: 0.01-0.05 per round.
-    ///   `score = score + rate * (DEFAULT_TRUST - score)`
     pub fn decay_toward_default(&mut self, rate: f32) {
-        let rate = rate.clamp(0.0, 1.0);
-        for score in self.scores.values_mut() {
-            *score += rate * (DEFAULT_TRUST - *score);
-        }
+        self.inner.decay_toward_default(rate);
     }
 
-    /// Remove peers that have been inactive (not updated) and whose score
-    /// has decayed back to approximately the default. Useful for cleaning
-    /// up stale entries from clients that have left the federation.
-    ///
-    /// Removes peers whose score is within `epsilon` of `DEFAULT_TRUST`.
+    /// Remove peers whose score is within `epsilon` of the default (0.5).
     pub fn prune_default_peers(&mut self, epsilon: f32) {
-        self.scores
-            .retain(|_, score| (*score - DEFAULT_TRUST).abs() > epsilon);
+        self.inner.prune_near_default(epsilon);
     }
 
     /// Compute influence weight in I16F16-compatible fixed-point representation.
     ///
-    /// Returns the influence weight as an i32 in Q16.16 format, using
-    /// saturating arithmetic to prevent overflow on the i32 path.
-    ///
-    /// Q16.16 range: [-32768.0, 32767.999...], so rep^3 * 0.8 is always
-    /// in range (max value = 0.8, well within bounds).
+    /// Returns the influence weight as an i32 in Q16.16 format.
     pub fn influence_weight_fixed(&self, peer: &PeerId) -> i32 {
         let score = self.get_score(peer);
-        // Compute rep^3 in f32, cap, then convert to Q16.16
         let rep_cubed = score * score * score;
         let capped = rep_cubed.min(INFLUENCE_CAP);
-        // Convert to Q16.16: multiply by 2^16 = 65536
         let fixed = (capped * 65536.0) as i32;
-        // Saturate to valid Q16.16 range (always positive for reputation)
         fixed.max(0)
     }
 }

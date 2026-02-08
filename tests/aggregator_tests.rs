@@ -1011,3 +1011,111 @@ fn test_krum_serde_roundtrip() {
         "Reputation should survive round-trip"
     );
 }
+
+// ===== Phase 5B: Multi-Krum integration tests =====
+
+#[test]
+fn test_multi_krum_via_aggregator() {
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+
+    let updates = vec![
+        array![[1.0, 2.0]],
+        array![[1.1, 2.1]],
+        array![[0.9, 1.9]],
+        array![[1.05, 2.05]],
+        array![[50.0, 50.0]], // Byzantine
+    ];
+
+    let result = agg.aggregate(&updates, None).unwrap();
+    // Multi-Krum averages top-3, result should be close to honest center
+    assert!(
+        result[[0, 0]] < 2.0,
+        "Multi-Krum should select honest vectors, got {}",
+        result[[0, 0]]
+    );
+    assert!(
+        result[[0, 1]] < 3.0,
+        "Multi-Krum param 1 should be near honest, got {}",
+        result[[0, 1]]
+    );
+}
+
+#[test]
+fn test_multi_krum_result_is_average() {
+    // Multi-Krum should return an average, not an exact input vector
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(0, 3), 0.0);
+
+    let updates = vec![array![[1.0]], array![[2.0]], array![[3.0]]];
+
+    let result = agg.aggregate(&updates, None).unwrap();
+    // All 3 selected, average = (1+2+3)/3 = 2.0
+    assert!(
+        (result[[0, 0]] - 2.0).abs() < 0.01,
+        "Multi-Krum m=n should average all, got {}",
+        result[[0, 0]]
+    );
+}
+
+#[test]
+fn test_multi_krum_too_few_clients() {
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+
+    let updates = vec![array![[1.0]], array![[2.0]]];
+    let result = agg.aggregate(&updates, None);
+    assert!(result.is_err(), "Multi-Krum with <3 clients should error");
+}
+
+#[test]
+fn test_multi_krum_serde_roundtrip() {
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+
+    let updates = vec![
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[1.0]],
+        array![[100.0]],
+    ];
+    let ids: Vec<String> = (0..5).map(|i| format!("c{}", i)).collect();
+    let _ = agg.aggregate(&updates, Some(&ids)).unwrap();
+
+    let json = serde_json::to_string(&agg).expect("serialize");
+    let restored: ByzantineAggregator = serde_json::from_str(&json).expect("deserialize");
+
+    assert!(
+        (restored.get_reputation("c0") - agg.get_reputation("c0")).abs() < 1e-6,
+        "Multi-Krum reputation should survive round-trip"
+    );
+}
+
+#[test]
+fn test_multi_krum_attack_resistance() {
+    // 4 honest + 1 Byzantine, Multi-Krum m=3 should pick 3 honest
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+
+    let updates = vec![
+        array![[1.0, 1.0]],
+        array![[1.1, 0.9]],
+        array![[0.9, 1.1]],
+        array![[1.05, 0.95]],
+        array![[100.0, 100.0]], // Byzantine
+    ];
+    let ids = vec![
+        "a".to_string(),
+        "b".to_string(),
+        "c".to_string(),
+        "d".to_string(),
+        "attacker".to_string(),
+    ];
+
+    let result = agg.aggregate(&updates, Some(&ids)).unwrap();
+    assert!(
+        result[[0, 0]] < 2.0,
+        "Multi-Krum should resist attack, got {}",
+        result[[0, 0]]
+    );
+    assert!(
+        agg.get_reputation("attacker") < agg.get_reputation("a"),
+        "Attacker reputation should be lower"
+    );
+}

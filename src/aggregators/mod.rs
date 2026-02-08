@@ -8,8 +8,10 @@
 //! | [`trimmed_mean`] | ~30% | Fast (parallel) |
 //! | [`median`] | ~50% | Fast (parallel) |
 //! | [`krum`] | n >= 2f+3 | O(n^2) |
+//! | Multi-Krum | n >= 2f+3, m <= n-2f-2 | O(n^2) |
 //! | [`fedavg`] | None (baseline) | Fastest |
 
+pub mod adaptive;
 pub mod fedavg;
 pub mod krum;
 pub mod median;
@@ -18,15 +20,16 @@ pub mod trimmed_mean;
 pub use fedavg::fedavg;
 pub use krum::aggregate_krum;
 pub use krum::aggregate_krum_bfp16;
+pub use krum::aggregate_multi_krum_bfp16;
 pub use median::median;
 pub use trimmed_mean::trimmed_mean;
 
 use ndarray::Array2;
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::QoraError;
+use crate::reputation::ReputationStore;
 
 /// Aggregation method selection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,11 +40,16 @@ pub enum AggregationMethod {
     Median,
     /// Standard FedAvg (no Byzantine tolerance, baseline)
     FedAvg,
-    /// Krum selection via Q16.16 fixed-point arithmetic (deterministic, n >= 2f+3)
+    /// Krum selection via BFP-16 block floating-point (deterministic, n >= 2f+3)
     ///
     /// The inner value is `f`, the maximum number of Byzantine nodes expected.
     /// Requires `n >= 2f + 3` clients for full guarantees (best-effort below).
     Krum(usize),
+    /// Multi-Krum: select top-m vectors by Krum score and average them.
+    ///
+    /// `(f, m)` — `f` is the max Byzantine count, `m` is the number of vectors
+    /// to select and average. For full tolerance, `m <= n - 2f - 2`.
+    MultiKrum(usize, usize),
 }
 
 /// High-level Byzantine-tolerant aggregator for federated learning.
@@ -72,10 +80,14 @@ pub enum AggregationMethod {
 pub struct ByzantineAggregator {
     method: AggregationMethod,
     trim_fraction: f32,
-    reputation: HashMap<String, f32>,
+    reputation: ReputationStore<String>,
     /// Clients below this reputation score are excluded from aggregation.
     /// Default: 0.0 (no gating). Set to e.g. 0.2 to enable ban gating.
     ban_threshold: f32,
+    /// When true and method is TrimmedMean, compute trim_fraction dynamically
+    /// from client reputation distribution each round.
+    #[serde(default)]
+    adaptive_trim: bool,
 }
 
 impl ByzantineAggregator {
@@ -90,8 +102,9 @@ impl ByzantineAggregator {
         Self {
             method,
             trim_fraction,
-            reputation: HashMap::new(),
+            reputation: ReputationStore::new(),
             ban_threshold: 0.0,
+            adaptive_trim: false,
         }
     }
 
@@ -107,9 +120,18 @@ impl ByzantineAggregator {
         Self {
             method,
             trim_fraction,
-            reputation: HashMap::new(),
+            reputation: ReputationStore::new(),
             ban_threshold,
+            adaptive_trim: false,
         }
+    }
+
+    /// Enable or disable adaptive trimming.
+    ///
+    /// When enabled and method is `TrimmedMean`, the trim fraction is computed
+    /// dynamically each round from the client reputation distribution.
+    pub fn set_adaptive_trim(&mut self, enabled: bool) {
+        self.adaptive_trim = enabled;
     }
 
     /// Aggregate client model updates.
@@ -157,11 +179,22 @@ impl ByzantineAggregator {
         let agg_updates = &filtered_updates;
 
         let result = match self.method {
-            AggregationMethod::TrimmedMean => trimmed_mean(agg_updates, self.trim_fraction)?,
+            AggregationMethod::TrimmedMean => {
+                let frac = if self.adaptive_trim {
+                    adaptive::compute_adaptive_trim(
+                        self.reputation.scores(),
+                        0.4,
+                        0.05,
+                        self.trim_fraction,
+                    )
+                } else {
+                    self.trim_fraction
+                };
+                trimmed_mean(agg_updates, frac)?
+            }
             AggregationMethod::Median => median(agg_updates)?,
             AggregationMethod::FedAvg => fedavg(agg_updates, None)?,
             AggregationMethod::Krum(f) => {
-                // Convert to BFP-16 for deterministic distance computation
                 let bfp_vecs: Vec<krum::Bfp16Vec> = agg_updates
                     .iter()
                     .map(|u| {
@@ -176,8 +209,32 @@ impl ByzantineAggregator {
                         actual: agg_updates.len(),
                     })?;
 
-                // Return the original f32 vector -- no quantization loss
                 agg_updates[best_idx].clone()
+            }
+            AggregationMethod::MultiKrum(f, m) => {
+                let bfp_vecs: Vec<krum::Bfp16Vec> = agg_updates
+                    .iter()
+                    .map(|u| {
+                        let flat: Vec<f32> = u.iter().copied().collect();
+                        krum::Bfp16Vec::from_f32_slice(&flat)
+                    })
+                    .collect();
+
+                let indices = aggregate_multi_krum_bfp16(&bfp_vecs, f, m).ok_or(
+                    QoraError::InsufficientQuorum {
+                        needed: 3,
+                        actual: agg_updates.len(),
+                    },
+                )?;
+
+                // Average the selected original f32 vectors
+                let m_eff = indices.len() as f32;
+                let mut avg = Array2::<f32>::zeros(agg_updates[0].raw_dim());
+                for &idx in &indices {
+                    avg += &agg_updates[idx];
+                }
+                avg /= m_eff;
+                avg
             }
         };
 
@@ -191,7 +248,7 @@ impl ByzantineAggregator {
 
     /// Get the reputation score for a client (default 0.5 for unknown clients).
     pub fn get_reputation(&self, client_id: &str) -> f32 {
-        self.reputation.get(client_id).copied().unwrap_or(0.5)
+        self.reputation.get_score(client_id)
     }
 
     /// Reset all reputation scores.
@@ -208,10 +265,7 @@ impl ByzantineAggregator {
     ///
     /// * `rate` - Decay rate in (0.0, 1.0). Typical: 0.01-0.05 per round.
     pub fn decay_reputations(&mut self, rate: f32) {
-        let rate = rate.clamp(0.0, 1.0);
-        for score in self.reputation.values_mut() {
-            *score += rate * (0.5 - *score);
-        }
+        self.reputation.decay_toward_default(rate);
     }
 
     /// Get the ban threshold for this aggregator.
@@ -230,13 +284,10 @@ impl ByzantineAggregator {
             let diff = update - result;
             let distance: f32 = diff.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-            let score = self.reputation.entry(id.clone()).or_insert(0.5);
             if distance < 1.0 {
-                // Close to aggregate -> reward
-                *score = (*score + 0.02).min(1.0);
+                self.reputation.reward(id.clone(), 0.02);
             } else if distance > 10.0 {
-                // Far from aggregate -> penalize
-                *score = (*score - 0.08).max(0.0);
+                self.reputation.penalize(id.clone(), 0.08);
             }
         }
     }

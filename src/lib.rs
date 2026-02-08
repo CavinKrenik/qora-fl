@@ -9,6 +9,7 @@
 //! - [`median()`] - Coordinate-wise median (~50% Byzantine tolerance)
 //! - [`aggregate_krum()`] - Krum selection with I16F16 fixed-point (n >= 2f+3)
 //! - [`aggregate_krum_bfp16()`] - Krum selection with BFP-16 block floating-point (n >= 2f+3)
+//! - [`aggregate_multi_krum_bfp16()`] - Multi-Krum: top-m selection + averaging (n >= 2f+3)
 //! - [`fedavg()`] - Standard FedAvg baseline (no Byzantine tolerance)
 //!
 //! ## High-Level API
@@ -27,11 +28,13 @@ pub mod verification;
 // Re-exports
 pub use aggregators::aggregate_krum;
 pub use aggregators::aggregate_krum_bfp16;
+pub use aggregators::aggregate_multi_krum_bfp16;
 pub use aggregators::fedavg;
 pub use aggregators::median;
 pub use aggregators::trimmed_mean;
 pub use aggregators::{AggregationMethod, ByzantineAggregator};
 pub use error::QoraError;
+pub use reputation::ReputationStore;
 pub use reputation::ReputationTracker;
 
 /// Library version
@@ -46,35 +49,69 @@ mod python {
     use numpy::{IntoPyArray, PyArray2};
     use pyo3::prelude::*;
 
+    use crate::reputation::ReputationStore;
     use crate::{AggregationMethod, QoraError};
 
     fn parse_method(method: &str) -> PyResult<AggregationMethod> {
+        let err_msg = "Use 'trimmed_mean', 'median', 'fedavg', 'krum[:N]', or 'multi_krum[:f:m]'";
         match method {
             "trimmed_mean" => Ok(AggregationMethod::TrimmedMean),
             "median" => Ok(AggregationMethod::Median),
             "fedavg" => Ok(AggregationMethod::FedAvg),
+            s if s.starts_with("multi_krum") => {
+                // Accept "multi_krum" (f=1, m=3) or "multi_krum:f:m"
+                let (f, m) = if s == "multi_krum" {
+                    (1, 3)
+                } else if let Some(params) = s.strip_prefix("multi_krum:") {
+                    let parts: Vec<&str> = params.split(':').collect();
+                    if parts.len() != 2 {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                            "Invalid multi_krum parameters '{}'. Use 'multi_krum' or 'multi_krum:f:m'",
+                            s
+                        )));
+                    }
+                    let f = parts[0].parse::<usize>().map_err(|_| {
+                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                            "Invalid multi_krum f parameter '{}'. {}",
+                            parts[0], err_msg
+                        ))
+                    })?;
+                    let m = parts[1].parse::<usize>().map_err(|_| {
+                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                            "Invalid multi_krum m parameter '{}'. {}",
+                            parts[1], err_msg
+                        ))
+                    })?;
+                    (f, m)
+                } else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Unknown method '{}'. {}",
+                        method, err_msg
+                    )));
+                };
+                Ok(AggregationMethod::MultiKrum(f, m))
+            }
             s if s.starts_with("krum") => {
-                // Accept "krum" (default f=1) or "krum:N" for custom f
                 let f = if s == "krum" {
                     1
                 } else if let Some(n) = s.strip_prefix("krum:") {
                     n.parse::<usize>().map_err(|_| {
                         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                            "Invalid krum parameter '{}'. Use 'krum' or 'krum:N'",
-                            s
+                            "Invalid krum parameter '{}'. {}",
+                            s, err_msg
                         ))
                     })?
                 } else {
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "Unknown method '{}'. Use 'trimmed_mean', 'median', 'fedavg', or 'krum[:N]'",
-                        method
+                        "Unknown method '{}'. {}",
+                        method, err_msg
                     )));
                 };
                 Ok(AggregationMethod::Krum(f))
             }
             _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Unknown method '{}'. Use 'trimmed_mean', 'median', 'fedavg', or 'krum[:N]'",
-                method
+                "Unknown method '{}'. {}",
+                method, err_msg
             ))),
         }
     }
@@ -99,10 +136,15 @@ mod python {
     #[pymethods]
     impl PyByzantineAggregator {
         #[new]
-        #[pyo3(signature = (method, trim_fraction, ban_threshold=0.0))]
-        fn new(method: String, trim_fraction: f32, ban_threshold: f32) -> PyResult<Self> {
+        #[pyo3(signature = (method, trim_fraction, ban_threshold=0.0, adaptive_trim=false))]
+        fn new(
+            method: String,
+            trim_fraction: f32,
+            ban_threshold: f32,
+            adaptive_trim: bool,
+        ) -> PyResult<Self> {
             let agg_method = parse_method(&method)?;
-            let inner = if ban_threshold > 0.0 {
+            let mut inner = if ban_threshold > 0.0 {
                 crate::ByzantineAggregator::with_ban_threshold(
                     agg_method,
                     trim_fraction,
@@ -111,6 +153,7 @@ mod python {
             } else {
                 crate::ByzantineAggregator::new(agg_method, trim_fraction)
             };
+            inner.set_adaptive_trim(adaptive_trim);
             Ok(Self { inner })
         }
 
@@ -185,7 +228,7 @@ mod python {
     /// are excluded from aggregation.
     #[pyclass(name = "ReputationManager")]
     struct PyReputationManager {
-        scores: HashMap<String, f32>,
+        inner: ReputationStore<String>,
         ban_threshold: f32,
     }
 
@@ -195,41 +238,39 @@ mod python {
         #[pyo3(signature = (ban_threshold=0.2))]
         fn new(ban_threshold: f32) -> Self {
             Self {
-                scores: HashMap::new(),
+                inner: ReputationStore::new(),
                 ban_threshold,
             }
         }
 
         /// Get the trust score for a client (default 0.5 for unknown).
         fn get_score(&self, client_id: &str) -> f32 {
-            self.scores.get(client_id).copied().unwrap_or(0.5)
+            self.inner.get_score(client_id)
         }
 
         /// Set the trust score for a client (clamped to [0.0, 1.0]).
         fn set_score(&mut self, client_id: String, score: f32) {
-            self.scores.insert(client_id, score.clamp(0.0, 1.0));
+            self.inner.set_score(client_id, score);
         }
 
         /// Increase a client's reputation by the given amount.
         fn reward(&mut self, client_id: String, amount: f32) {
-            let score = self.scores.entry(client_id).or_insert(0.5);
-            *score = (*score + amount).min(1.0);
+            self.inner.reward(client_id, amount);
         }
 
         /// Decrease a client's reputation by the given amount.
         fn penalize(&mut self, client_id: String, amount: f32) {
-            let score = self.scores.entry(client_id).or_insert(0.5);
-            *score = (*score - amount).max(0.0);
+            self.inner.penalize(client_id, amount);
         }
 
         /// Check if a client is banned (score below ban threshold).
         fn is_banned(&self, client_id: &str) -> bool {
-            self.get_score(client_id) < self.ban_threshold
+            self.inner.is_banned(client_id, self.ban_threshold)
         }
 
         /// Get all non-banned clients and their scores.
         fn active_clients(&self) -> Vec<(String, f32)> {
-            self.scores
+            self.inner
                 .iter()
                 .filter(|(_, &score)| score >= self.ban_threshold)
                 .map(|(id, &score)| (id.clone(), score))
@@ -238,26 +279,41 @@ mod python {
 
         /// Get all client scores as a dictionary.
         fn all_scores(&self) -> HashMap<String, f32> {
-            self.scores.clone()
+            self.inner.iter().map(|(k, &v)| (k.clone(), v)).collect()
         }
 
         /// Reset all reputation scores.
         fn reset(&mut self) {
-            self.scores.clear();
+            self.inner.clear();
+        }
+
+        /// Decay all reputation scores toward 0.5 (default).
+        ///
+        /// Args:
+        ///     rate: Decay rate in (0.0, 1.0). Typical: 0.01-0.05.
+        #[pyo3(signature = (rate=0.02))]
+        fn decay(&mut self, rate: f32) {
+            self.inner.decay_toward_default(rate);
+        }
+
+        /// Compute the influence weight for a client: min(rep^3, 0.8).
+        fn influence_weight(&self, client_id: &str) -> f32 {
+            self.inner.influence_weight(client_id, 0.8)
         }
 
         /// Serialize reputation state to JSON for persistence between restarts.
         fn to_json(&self) -> PyResult<String> {
-            serde_json::to_string(&self.scores).map_err(json_err)
+            serde_json::to_string(&self.inner).map_err(json_err)
         }
 
         /// Restore reputation state from a JSON string.
         #[staticmethod]
         #[pyo3(signature = (json_str, ban_threshold=0.2))]
         fn from_json(json_str: &str, ban_threshold: f32) -> PyResult<Self> {
-            let scores: HashMap<String, f32> = serde_json::from_str(json_str).map_err(json_err)?;
+            let inner: ReputationStore<String> =
+                serde_json::from_str(json_str).map_err(json_err)?;
             Ok(Self {
-                scores,
+                inner,
                 ban_threshold,
             })
         }

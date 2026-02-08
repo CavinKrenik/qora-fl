@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-02-08
+
+### Added
+- **Multi-Krum aggregation**: Select top-m updates by Krum score and average them
+  - `AggregationMethod::MultiKrum(f, m)` in Rust
+  - Python: `"multi_krum"` (defaults f=1, m=3) or `"multi_krum:f:m"`
+  - Smoother convergence than single Krum while maintaining Byzantine robustness
+- **Generic `ReputationStore<ID>`**: Unified reputation system (`src/reputation/store.rs`)
+  - Shared by both `ReputationTracker` (byte-array IDs) and `ByzantineAggregator` (string IDs)
+  - Methods: `reward`, `penalize`, `is_banned`, `influence_weight`, `decay_toward_default`, `prune_near_default`
+  - Backward-compatible serialization via `#[serde(transparent)]`
+- **Adaptive trim fraction**: Dynamic `trim_fraction` from reputation distribution
+  - `ByzantineAggregator::set_adaptive_trim(true)` / `adaptive_trim=True` in Python
+  - Automatically increases trimming when many clients have low reputation
+- **Verification module** (`src/verification/`):
+  - `check_norm_bound` / `filter_by_norm_bound`: L2 norm verification for updates
+  - `krum_condition_met` / `max_tolerable_f`: Krum safety condition checks
+  - `AuditLog`: Append-only aggregation audit log for post-hoc analysis
+- **Math module** (`src/math/`): `l2_norm` and `l2_norm_sq` utilities
+- **Python API additions**:
+  - `ReputationManager.decay(rate)` and `ReputationManager.influence_weight(client_id)`
+  - `ByzantineAggregator` accepts `adaptive_trim` parameter
+- Multi-Krum Criterion benchmark (`multi_krum_m3`)
+- 39 new tests (142 total: 90 unit + 51 integration + 1 doctest)
+
+### Changed
+- Krum score computation extracted to shared `compute_krum_scores_bfp16` helper (used by both Krum and Multi-Krum)
+- `ByzantineAggregator` reputation field changed from `HashMap<String, f32>` to `ReputationStore<String>`
+- `ReputationTracker` now wraps `ReputationStore<[u8;32]>` via `#[serde(flatten)]`
+- `PyReputationManager` refactored to wrap `ReputationStore<String>`
+
 ## [0.3.0] - 2026-02-06
 
 ### Added

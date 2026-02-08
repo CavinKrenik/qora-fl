@@ -38,8 +38,8 @@ Qora-FL is designed as **infrastructure**, emphasizing:
 
 ```
 Clients produce model updates
-        │
-        ▼
+             │
+             ▼
 ┌────────────────────────────────┐
 │   Qora Robust Aggregator       │
 │                                │

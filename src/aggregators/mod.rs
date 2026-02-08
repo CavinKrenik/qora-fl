@@ -17,10 +17,10 @@ pub mod trimmed_mean;
 
 pub use fedavg::fedavg;
 pub use krum::aggregate_krum;
+pub use krum::aggregate_krum_bfp16;
 pub use median::median;
 pub use trimmed_mean::trimmed_mean;
 
-use fixed::types::I16F16;
 use ndarray::Array2;
 use std::collections::HashMap;
 
@@ -161,23 +161,23 @@ impl ByzantineAggregator {
             AggregationMethod::Median => median(agg_updates)?,
             AggregationMethod::FedAvg => fedavg(agg_updates, None)?,
             AggregationMethod::Krum(f) => {
-                // Convert Array2<f32> -> Vec<I16F16> for deterministic selection
-                let dim = agg_updates[0].dim();
-                let fixed_vecs: Vec<Vec<I16F16>> = agg_updates
+                // Convert to BFP-16 for deterministic distance computation
+                let bfp_vecs: Vec<krum::Bfp16Vec> = agg_updates
                     .iter()
-                    .map(|u| u.iter().map(|&v| I16F16::from_num(v)).collect())
+                    .map(|u| {
+                        let flat: Vec<f32> = u.iter().copied().collect();
+                        krum::Bfp16Vec::from_f32_slice(&flat)
+                    })
                     .collect();
 
-                let selected =
-                    aggregate_krum(&fixed_vecs, f).ok_or(QoraError::InsufficientQuorum {
+                let best_idx =
+                    aggregate_krum_bfp16(&bfp_vecs, f).ok_or(QoraError::InsufficientQuorum {
                         needed: 3,
                         actual: agg_updates.len(),
                     })?;
 
-                // Convert back: I16F16 -> f32
-                let f32_vec: Vec<f32> = selected.iter().map(|v| v.to_num::<f32>()).collect();
-                Array2::from_shape_vec(dim, f32_vec)
-                    .map_err(|e| QoraError::ShapeError(e.to_string()))?
+                // Return the original f32 vector -- no quantization loss
+                agg_updates[best_idx].clone()
             }
         };
 

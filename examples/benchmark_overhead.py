@@ -23,7 +23,7 @@ SIZES = [
     ("11M params (ResNet-18)", (1, 11_000_000)),
 ]
 NUM_CLIENTS = [10, 50, 100]
-METHODS = ["fedavg", "trimmed_mean", "median"]
+METHODS = ["fedavg", "trimmed_mean", "median", "krum"]
 N_WARMUP = 3
 N_RUNS = 20
 

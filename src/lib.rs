@@ -7,7 +7,8 @@
 //!
 //! - [`trimmed_mean()`] - Coordinate-wise trimmed mean (~30% Byzantine tolerance)
 //! - [`median()`] - Coordinate-wise median (~50% Byzantine tolerance)
-//! - [`aggregate_krum()`] - Krum selection with fixed-point math (n >= 2f+3)
+//! - [`aggregate_krum()`] - Krum selection with I16F16 fixed-point (n >= 2f+3)
+//! - [`aggregate_krum_bfp16()`] - Krum selection with BFP-16 block floating-point (n >= 2f+3)
 //! - [`fedavg()`] - Standard FedAvg baseline (no Byzantine tolerance)
 //!
 //! ## High-Level API
@@ -25,6 +26,7 @@ pub mod verification;
 
 // Re-exports
 pub use aggregators::aggregate_krum;
+pub use aggregators::aggregate_krum_bfp16;
 pub use aggregators::fedavg;
 pub use aggregators::median;
 pub use aggregators::trimmed_mean;

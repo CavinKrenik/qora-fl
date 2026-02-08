@@ -6,6 +6,7 @@
 //! Reference: "Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent"
 
 use fixed::types::I16F16;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Block Floating Point Vector (BFP-16)
@@ -93,6 +94,47 @@ pub fn dist_sq(a: &[I16F16], b: &[I16F16]) -> I16F16 {
     sum
 }
 
+/// Maximum exponent difference for BFP-16 distance computation.
+/// Beyond this, vectors are at vastly different scales (~2^15x apart).
+const MAX_BFP16_EXP_DIFF: u32 = 15;
+
+/// Calculates the squared Euclidean distance between two BFP-16 vectors
+/// using pure integer arithmetic for cross-platform determinism.
+///
+/// Aligns mantissas to a common exponent, then accumulates squared
+/// differences in `i64` with saturating arithmetic.
+///
+/// Returns `i64::MAX` on length mismatch or when exponent difference
+/// exceeds [`MAX_BFP16_EXP_DIFF`] (vectors at incomparable scales).
+pub fn dist_sq_bfp16(a: &Bfp16Vec, b: &Bfp16Vec) -> i64 {
+    if a.mantissas.len() != b.mantissas.len() {
+        return i64::MAX;
+    }
+    if a.mantissas.is_empty() {
+        return 0;
+    }
+
+    let exp_diff = (a.exponent as i32) - (b.exponent as i32);
+    let abs_diff = exp_diff.unsigned_abs();
+
+    if abs_diff > MAX_BFP16_EXP_DIFF {
+        return i64::MAX;
+    }
+
+    let mut sum: i64 = 0;
+    for (&ma, &mb) in a.mantissas.iter().zip(b.mantissas.iter()) {
+        // Align to common exponent by shifting the higher-exponent side
+        let (va, vb): (i32, i32) = if exp_diff >= 0 {
+            ((ma as i32) << abs_diff, mb as i32)
+        } else {
+            (ma as i32, (mb as i32) << abs_diff)
+        };
+        let diff = (va as i64) - (vb as i64);
+        sum = sum.saturating_add(diff.saturating_mul(diff));
+    }
+    sum
+}
+
 /// Selects the "best" vector using the Krum rule.
 ///
 /// Selects the vector that minimizes the sum of squared distances to its
@@ -163,6 +205,61 @@ pub fn aggregate_krum(vectors: &[Vec<I16F16>], f: usize) -> Option<Vec<I16F16>> 
 
     // Return a clone of the winning vector
     Some(vectors[best_idx].clone())
+}
+
+/// Selects the best vector index using Krum with BFP-16 distance computation.
+///
+/// Uses [`Bfp16Vec`] block floating-point encoding for distance calculations,
+/// handling the full f32 range without the I16F16 overflow/underflow issues.
+/// The outer score loop is parallelized with rayon.
+///
+/// Returns `Some(index)` of the selected vector, or `None` if n < 3.
+///
+/// # Arguments
+/// * `vectors` - BFP-16 encoded model update vectors
+/// * `f` - Maximum number of Byzantine nodes expected
+pub fn aggregate_krum_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<usize> {
+    let n = vectors.len();
+
+    if n < 3 {
+        return None;
+    }
+
+    if n < 2 * f + 3 {
+        eprintln!(
+            "WARN: Krum condition not met (n={} < 2*f+3={}). Proceeding with best-effort.",
+            n,
+            2 * f + 3
+        );
+    }
+
+    let k = if n > f + 2 { n - f - 2 } else { 1 };
+
+    // Parallel score computation: each vector's score is independent
+    let scores: Vec<i64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut distances: Vec<i64> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| dist_sq_bfp16(&vectors[i], &vectors[j]))
+                .collect();
+
+            distances.sort_unstable();
+
+            let mut score: i64 = 0;
+            for d in distances.iter().take(k) {
+                score = score.saturating_add(*d);
+            }
+            score
+        })
+        .collect();
+
+    // Sequential selection for deterministic tie-breaking (first minimum wins)
+    scores
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &score)| score)
+        .map(|(idx, _)| idx)
 }
 
 #[cfg(test)]
@@ -264,6 +361,125 @@ mod tests {
             val < 10.0,
             "f=0 Krum should still avoid obvious outlier: {}",
             val
+        );
+    }
+
+    // ===== BFP-16 distance tests =====
+
+    #[test]
+    fn test_dist_sq_bfp16_identical() {
+        let a = Bfp16Vec::from_f32_slice(&[1.0, 2.0, 3.0]);
+        assert_eq!(dist_sq_bfp16(&a, &a), 0);
+    }
+
+    #[test]
+    fn test_dist_sq_bfp16_simple() {
+        let a = Bfp16Vec::from_f32_slice(&[0.0, 0.0]);
+        let b = Bfp16Vec::from_f32_slice(&[3.0, 4.0]);
+        let d = dist_sq_bfp16(&a, &b);
+        // Should be positive and represent ~25 (3^2 + 4^2)
+        assert!(d > 0, "Distance should be positive, got {}", d);
+    }
+
+    #[test]
+    fn test_dist_sq_bfp16_length_mismatch() {
+        let a = Bfp16Vec::from_f32_slice(&[1.0]);
+        let b = Bfp16Vec::from_f32_slice(&[1.0, 2.0]);
+        assert_eq!(dist_sq_bfp16(&a, &b), i64::MAX);
+    }
+
+    #[test]
+    fn test_dist_sq_bfp16_empty() {
+        let a = Bfp16Vec::from_f32_slice(&[]);
+        let b = Bfp16Vec::from_f32_slice(&[]);
+        assert_eq!(dist_sq_bfp16(&a, &b), 0);
+    }
+
+    #[test]
+    fn test_dist_sq_bfp16_different_exponents() {
+        let a = Bfp16Vec::from_f32_slice(&[1000.0, 2000.0]);
+        let b = Bfp16Vec::from_f32_slice(&[1.0, 2.0]);
+        let d = dist_sq_bfp16(&a, &b);
+        assert!(d > 0);
+        assert_ne!(d, i64::MAX, "Exponents should be within range");
+    }
+
+    #[test]
+    fn test_dist_sq_bfp16_extreme_scale_difference() {
+        // Exponent difference > 15 should return MAX
+        let a = Bfp16Vec::from_f32_slice(&[1e10, 1e10]);
+        let b = Bfp16Vec::from_f32_slice(&[1e-10, 1e-10]);
+        let d = dist_sq_bfp16(&a, &b);
+        assert_eq!(d, i64::MAX);
+    }
+
+    #[test]
+    fn test_dist_sq_bfp16_symmetry() {
+        let a = Bfp16Vec::from_f32_slice(&[1.0, 2.0, 3.0]);
+        let b = Bfp16Vec::from_f32_slice(&[4.0, 5.0, 6.0]);
+        assert_eq!(dist_sq_bfp16(&a, &b), dist_sq_bfp16(&b, &a));
+    }
+
+    // ===== BFP-16 Krum selection tests =====
+
+    #[test]
+    fn test_krum_bfp16_selects_honest() {
+        let vectors: Vec<Bfp16Vec> = vec![
+            Bfp16Vec::from_f32_slice(&[1.0, 1.1]),
+            Bfp16Vec::from_f32_slice(&[0.9, 1.0]),
+            Bfp16Vec::from_f32_slice(&[1.05, 0.95]),
+            Bfp16Vec::from_f32_slice(&[1.0, 1.0]),
+            Bfp16Vec::from_f32_slice(&[100.0, 100.0]), // Byzantine
+        ];
+        let idx = aggregate_krum_bfp16(&vectors, 1).unwrap();
+        assert_ne!(idx, 4, "Should not select the Byzantine vector");
+    }
+
+    #[test]
+    fn test_krum_bfp16_returns_none_small_n() {
+        let empty: Vec<Bfp16Vec> = vec![];
+        assert!(aggregate_krum_bfp16(&empty, 0).is_none());
+
+        let one = vec![Bfp16Vec::from_f32_slice(&[1.0])];
+        assert!(aggregate_krum_bfp16(&one, 0).is_none());
+
+        let two = vec![
+            Bfp16Vec::from_f32_slice(&[1.0]),
+            Bfp16Vec::from_f32_slice(&[2.0]),
+        ];
+        assert!(aggregate_krum_bfp16(&two, 0).is_none());
+    }
+
+    #[test]
+    fn test_krum_bfp16_determinism() {
+        let vectors: Vec<Bfp16Vec> = vec![
+            Bfp16Vec::from_f32_slice(&[1.0, 2.0]),
+            Bfp16Vec::from_f32_slice(&[1.1, 2.1]),
+            Bfp16Vec::from_f32_slice(&[0.9, 1.9]),
+            Bfp16Vec::from_f32_slice(&[1.05, 2.05]),
+            Bfp16Vec::from_f32_slice(&[50.0, 50.0]),
+        ];
+        let r1 = aggregate_krum_bfp16(&vectors, 1);
+        let r2 = aggregate_krum_bfp16(&vectors, 1);
+        let r3 = aggregate_krum_bfp16(&vectors, 1);
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+    }
+
+    #[test]
+    fn test_krum_bfp16_large_values() {
+        // Values that would overflow I16F16 (>32767)
+        let vectors: Vec<Bfp16Vec> = vec![
+            Bfp16Vec::from_f32_slice(&[50000.0, 50001.0]),
+            Bfp16Vec::from_f32_slice(&[50000.5, 50000.5]),
+            Bfp16Vec::from_f32_slice(&[49999.0, 50002.0]),
+            Bfp16Vec::from_f32_slice(&[50000.0, 50000.0]),
+            Bfp16Vec::from_f32_slice(&[999999.0, 999999.0]), // Byzantine
+        ];
+        let idx = aggregate_krum_bfp16(&vectors, 1).unwrap();
+        assert_ne!(
+            idx, 4,
+            "Should not select Byzantine vector even with large values"
         );
     }
 }

@@ -915,6 +915,78 @@ fn test_reputation_tracker_prune() {
     );
 }
 
+// ===== Phase 3.5: BFP-16 Krum integration tests =====
+
+#[test]
+fn test_krum_returns_original_f32_values() {
+    // Krum now returns the exact original f32 vector (no I16F16 quantization)
+    let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(1), 0.0);
+
+    let updates = vec![
+        array![[1.0, 2.0]],
+        array![[1.1, 2.1]],
+        array![[0.9, 1.9]],
+        array![[1.05, 2.05]],
+        array![[50.0, 50.0]],
+    ];
+
+    let result = agg.aggregate(&updates, None).unwrap();
+
+    // Result must be exactly one of the honest input vectors (no quantization)
+    let is_exact_match = updates[..4].iter().any(|u| u == &result);
+    assert!(
+        is_exact_match,
+        "Result should be an exact copy of one input vector, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_krum_handles_large_weights() {
+    // Values that exceed I16F16 range -- would have been clamped before BFP-16
+    let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(1), 0.0);
+
+    let updates = vec![
+        array![[50000.0, -40000.0]],
+        array![[50001.0, -39999.0]],
+        array![[49999.0, -40001.0]],
+        array![[50000.5, -40000.5]],
+        array![[999999.0, -999999.0]], // Byzantine
+    ];
+
+    let result = agg.aggregate(&updates, None).unwrap();
+    assert!(
+        result[[0, 0]] > 40000.0 && result[[0, 0]] < 60000.0,
+        "Should select honest vector, got {}",
+        result[[0, 0]]
+    );
+}
+
+#[test]
+fn test_krum_bfp16_parallel_determinism() {
+    // Stress-test rayon determinism across many invocations
+    let updates = vec![
+        array![[1.0, 2.0, 3.0]],
+        array![[1.1, 2.1, 3.1]],
+        array![[0.9, 1.9, 2.9]],
+        array![[1.05, 2.05, 3.05]],
+        array![[50.0, 50.0, 50.0]],
+    ];
+
+    let mut results = Vec::new();
+    for _ in 0..20 {
+        let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(1), 0.0);
+        results.push(agg.aggregate(&updates, None).unwrap());
+    }
+
+    for r in &results[1..] {
+        assert_eq!(
+            &results[0], r,
+            "Parallel BFP-16 Krum must be deterministic across invocations"
+        );
+    }
+}
+
 #[test]
 fn test_krum_serde_roundtrip() {
     let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(2), 0.0);

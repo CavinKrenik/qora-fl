@@ -1,6 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use ndarray::Array2;
-use qora_fl::{fedavg, median, trimmed_mean};
+use qora_fl::aggregators::AggregationMethod;
+use qora_fl::{fedavg, median, trimmed_mean, ByzantineAggregator};
 
 fn bench_aggregation(c: &mut Criterion) {
     let mut group = c.benchmark_group("aggregation");
@@ -27,6 +28,13 @@ fn bench_aggregation(c: &mut Criterion) {
 
             group.bench_with_input(BenchmarkId::new("fedavg", &id), &updates, |b, updates| {
                 b.iter(|| fedavg(updates, None).unwrap())
+            });
+
+            group.bench_with_input(BenchmarkId::new("krum", &id), &updates, |b, updates| {
+                b.iter(|| {
+                    let mut agg = ByzantineAggregator::new(AggregationMethod::Krum(1), 0.0);
+                    agg.aggregate(updates, None).unwrap()
+                })
             });
         }
     }

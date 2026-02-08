@@ -19,6 +19,7 @@ fn main() {
         ("FedAvg (no defense)", AggregationMethod::FedAvg),
         ("Trimmed Mean (Qora)", AggregationMethod::TrimmedMean),
         ("Median", AggregationMethod::Median),
+        ("Krum (Qora, f=3)", AggregationMethod::Krum(3)),
     ];
 
     for (name, method) in methods {
@@ -35,5 +36,5 @@ fn main() {
         println!("{:<25} Result: {:.2}  {}", name, value, status);
     }
 
-    println!("\nTrimmed Mean and Median successfully defend against 30% attack!");
+    println!("\nTrimmed Mean, Median, and Krum successfully defend against 30% attack!");
 }

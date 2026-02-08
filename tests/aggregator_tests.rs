@@ -1119,3 +1119,188 @@ fn test_multi_krum_attack_resistance() {
         "Attacker reputation should be lower"
     );
 }
+
+// ===== BFP-16 Accuracy Analysis =====
+
+#[test]
+fn test_bfp16_krum_index_agreement() {
+    use qora_fl::aggregators::krum::{aggregate_krum_bfp16, Bfp16Vec};
+    use rand::prelude::*;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let n_trials = 100;
+    let n_clients = 7;
+    let dim = 100;
+    let f = 1;
+    let k = n_clients - f - 2; // 4 nearest neighbors
+    let mut agreements = 0;
+
+    for _ in 0..n_trials {
+        // Generate random f32 vectors (uniform [-1, 1])
+        let vectors: Vec<Vec<f32>> = (0..n_clients)
+            .map(|_| (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+
+        // f64-precision brute-force Krum
+        let f64_best = (0..n_clients)
+            .min_by(|&i, &j| {
+                let score_i: f64 = {
+                    let mut dists: Vec<f64> = (0..n_clients)
+                        .filter(|&x| x != i)
+                        .map(|x| {
+                            vectors[i]
+                                .iter()
+                                .zip(&vectors[x])
+                                .map(|(a, b)| {
+                                    let diff = (*a as f64) - (*b as f64);
+                                    diff * diff
+                                })
+                                .sum()
+                        })
+                        .collect();
+                    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    dists[..k].iter().sum()
+                };
+                let score_j: f64 = {
+                    let mut dists: Vec<f64> = (0..n_clients)
+                        .filter(|&x| x != j)
+                        .map(|x| {
+                            vectors[j]
+                                .iter()
+                                .zip(&vectors[x])
+                                .map(|(a, b)| {
+                                    let diff = (*a as f64) - (*b as f64);
+                                    diff * diff
+                                })
+                                .sum()
+                        })
+                        .collect();
+                    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    dists[..k].iter().sum()
+                };
+                score_i.partial_cmp(&score_j).unwrap()
+            })
+            .unwrap();
+
+        // BFP-16 Krum
+        let bfp_vecs: Vec<Bfp16Vec> = vectors
+            .iter()
+            .map(|v| Bfp16Vec::from_f32_slice(v))
+            .collect();
+        let bfp16_best = aggregate_krum_bfp16(&bfp_vecs, f).unwrap();
+
+        if f64_best == bfp16_best {
+            agreements += 1;
+        }
+    }
+
+    let agreement_rate = agreements as f64 / n_trials as f64;
+    assert!(
+        agreement_rate >= 0.90,
+        "BFP-16 Krum agreement rate {:.1}% is below 90% threshold",
+        agreement_rate * 100.0
+    );
+}
+
+#[test]
+fn test_bfp16_roundtrip_quantization_error() {
+    use qora_fl::aggregators::krum::Bfp16Vec;
+    use rand::prelude::*;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(123);
+    let n_trials = 200;
+    let dim = 500;
+    let mut total_rel_error = 0.0f64;
+    let mut count = 0u64;
+
+    for trial in 0..n_trials {
+        // Vary scale: 1e-2 to 1e2
+        let scale = 10.0f32.powf((trial as f32 / n_trials as f32) * 4.0 - 2.0);
+        let original: Vec<f32> = (0..dim)
+            .map(|_| (rng.gen::<f32>() * 2.0 - 1.0) * scale)
+            .collect();
+
+        let bfp = Bfp16Vec::from_f32_slice(&original);
+        let recovered = bfp.to_vec_f32();
+
+        for (o, r) in original.iter().zip(recovered.iter()) {
+            if o.abs() > scale * 0.01 {
+                // Only measure relative error for values not near zero relative to block max
+                let rel = ((*o - *r) as f64).abs() / (*o as f64).abs();
+                total_rel_error += rel;
+                count += 1;
+            }
+        }
+    }
+
+    let mean_rel_error = total_rel_error / count as f64;
+    assert!(
+        mean_rel_error < 0.01,
+        "Mean relative error {:.6} exceeds 1% threshold",
+        mean_rel_error
+    );
+}
+
+#[test]
+fn test_bfp16_krum_agreement_with_byzantine() {
+    use qora_fl::aggregators::krum::{aggregate_krum_bfp16, Bfp16Vec};
+    use rand::prelude::*;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+    let n_trials = 100;
+    let n_clients = 7;
+    let dim = 100;
+    let f = 1;
+    let k = n_clients - f - 2;
+    let mut agreements = 0;
+
+    for _ in 0..n_trials {
+        // 6 honest vectors near origin, 1 Byzantine at 100x
+        let mut vectors: Vec<Vec<f32>> = (0..n_clients - 1)
+            .map(|_| (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        vectors.push((0..dim).map(|_| 100.0 + rng.gen::<f32>()).collect());
+
+        // f64-precision brute-force Krum
+        let f64_best = (0..n_clients)
+            .min_by(|&i, &j| {
+                let score = |idx: usize| -> f64 {
+                    let mut dists: Vec<f64> = (0..n_clients)
+                        .filter(|&x| x != idx)
+                        .map(|x| {
+                            vectors[idx]
+                                .iter()
+                                .zip(&vectors[x])
+                                .map(|(a, b)| {
+                                    let d = (*a as f64) - (*b as f64);
+                                    d * d
+                                })
+                                .sum()
+                        })
+                        .collect();
+                    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    dists[..k].iter().sum()
+                };
+                score(i).partial_cmp(&score(j)).unwrap()
+            })
+            .unwrap();
+
+        // BFP-16 Krum
+        let bfp_vecs: Vec<Bfp16Vec> = vectors
+            .iter()
+            .map(|v| Bfp16Vec::from_f32_slice(v))
+            .collect();
+        let bfp16_best = aggregate_krum_bfp16(&bfp_vecs, f).unwrap();
+
+        if f64_best == bfp16_best {
+            agreements += 1;
+        }
+    }
+
+    let agreement_rate = agreements as f64 / n_trials as f64;
+    assert!(
+        agreement_rate >= 0.95,
+        "BFP-16 Krum with Byzantine agreement rate {:.1}% is below 95% threshold",
+        agreement_rate * 100.0
+    );
+}

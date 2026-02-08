@@ -1,44 +1,30 @@
 """
-MNIST Poisoning Demo: FedAvg vs Qora-FL
-========================================
-Simulates federated learning on MNIST with 30% malicious clients
-performing label-flipping attacks (0<->9, 1<->8, 2<->7, ...).
+Adaptive Trim Evaluation
+=========================
+Compares static vs adaptive trimmed mean under varying Byzantine fractions.
 
-Demonstrates that FedAvg degrades under attack while Qora-FL's
-robust aggregation methods (trimmed mean, median, Krum) maintain accuracy.
-
-Requirements::
-
-    pip install qora-fl matplotlib scikit-learn
+Demonstrates that adaptive trimming tracks the attack intensity and maintains
+better accuracy than a fixed trim fraction when the attack rate is unknown.
 
 Usage::
 
-    python examples/mnist_poisoning_demo.py
+    pip install qora-fl scikit-learn
+    python examples/adaptive_trim_eval.py
 """
 
 import numpy as np
-
-try:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
 
 from qora import ByzantineAggregator
 
 # --- Configuration ---
 import argparse
-NUM_CLIENTS = 10
-BYZANTINE_FRACTION = 0.3
-NUM_ROUNDS = 20
+NUM_CLIENTS = 20
+NUM_ROUNDS = 15
 LOCAL_EPOCHS = 1
 LEARNING_RATE = 0.1
 HIDDEN_SIZE = 128
 SEED = 42
+BYZANTINE_FRACTIONS = [0.0, 0.1, 0.2, 0.3, 0.4]
 
 
 # --- Simple numpy MLP ---
@@ -65,42 +51,32 @@ class SimpleMLP:
         self.W1, self.b1, self.W2, self.b2 = [p.copy() for p in params]
 
     def forward(self, X):
-        h = np.maximum(0, X @ self.W1 + self.b1)  # ReLU
+        h = np.maximum(0, X @ self.W1 + self.b1)
         logits = h @ self.W2 + self.b2
-        # Numerically stable softmax
         logits -= logits.max(axis=1, keepdims=True)
         exp_logits = np.exp(logits)
         return exp_logits / exp_logits.sum(axis=1, keepdims=True)
 
     def train_one_epoch(self, X, y, lr):
-        """One epoch of mini-batch SGD with batch size 64."""
         batch_size = 64
         indices = np.arange(len(X))
         np.random.shuffle(indices)
         for start in range(0, len(X), batch_size):
             batch_idx = indices[start : start + batch_size]
             Xb, yb = X[batch_idx], y[batch_idx]
-
-            # Forward
             h = np.maximum(0, Xb @ self.W1 + self.b1)
             logits = h @ self.W2 + self.b2
             logits -= logits.max(axis=1, keepdims=True)
             probs = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
-
-            # Cross-entropy gradient
             one_hot = np.zeros_like(probs)
             one_hot[np.arange(len(yb)), yb] = 1
             d_logits = (probs - one_hot) / len(yb)
-
-            # Backward
             dW2 = h.T @ d_logits
             db2 = d_logits.sum(axis=0)
             dh = d_logits @ self.W2.T
-            dh[h <= 0] = 0  # ReLU gradient
+            dh[h <= 0] = 0
             dW1 = Xb.T @ dh
             db1 = dh.sum(axis=0)
-
-            # Update
             self.W1 -= lr * dW1
             self.b1 -= lr * db1
             self.W2 -= lr * dW2
@@ -109,8 +85,7 @@ class SimpleMLP:
     def evaluate(self, X, y):
         probs = self.forward(X)
         preds = probs.argmax(axis=1)
-        accuracy = (preds == y).mean()
-        return accuracy
+        return (preds == y).mean()
 
 
 # --- Data utilities ---
@@ -140,13 +115,9 @@ def load_data():
             y = rng.integers(0, 10, size=5000).astype(np.int64)
             dataset_name = "Synthetic"
 
-    # Split train/test (~85/15)
     n = len(X)
     split = int(n * 6 / 7)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
-    input_size = X.shape[1]
-    return X_train, y_train, X_test, y_test, input_size, dataset_name
+    return X[:split], y[:split], X[split:], y[split:], X.shape[1], dataset_name
 
 
 def partition_data(X, y, n_clients, rng):
@@ -161,15 +132,12 @@ def flip_labels(y):
     return (9 - y).astype(y.dtype)
 
 
-# --- Federated training ---
 def flatten_params(params):
-    """Flatten list of parameter arrays into a single (1, N) array."""
     flat = np.concatenate([p.flatten() for p in params])
     return flat.reshape(1, -1).astype(np.float32)
 
 
 def unflatten_params(flat, shapes):
-    """Restore flat array back to list of parameter arrays with original shapes."""
     params = []
     offset = 0
     for shape in shapes:
@@ -179,10 +147,9 @@ def unflatten_params(flat, shapes):
     return params
 
 
-def federated_round(
-    global_params, client_data, aggregator, n_byzantine, input_size
-):
-    """One federated round: distribute -> local train -> aggregate."""
+# --- Federated training ---
+def federated_round(global_params, client_data, aggregator, n_byzantine, input_size):
+    """One federated round with label-flipping attack."""
     shapes = [p.shape for p in global_params]
     updates = []
     client_ids = []
@@ -190,131 +157,83 @@ def federated_round(
     for i, (X_i, y_i) in enumerate(client_data):
         model = SimpleMLP(input_size)
         model.set_parameters(global_params)
-
-        # Byzantine clients train on flipped labels
         if i < n_byzantine:
             y_i = flip_labels(y_i)
-
         for _ in range(LOCAL_EPOCHS):
             model.train_one_epoch(X_i, y_i, LEARNING_RATE)
-
-        # Compute update delta (new - old)
         new_params = model.get_parameters()
         delta = [new - old for new, old in zip(new_params, global_params)]
         updates.append(flatten_params(delta))
         client_ids.append(f"client_{i}")
 
-    # Aggregate deltas
     aggregated_flat = aggregator.aggregate(updates, client_ids)
     aggregated_delta = unflatten_params(aggregated_flat.flatten(), shapes)
-
-    # Apply aggregated update
-    new_global = [g + d for g, d in zip(global_params, aggregated_delta)]
-    return new_global
+    return [g + d for g, d in zip(global_params, aggregated_delta)]
 
 
-def run_experiment(
-    method_name, client_data, X_test, y_test, n_byzantine, input_size
-):
-    """Run NUM_ROUNDS of federated training with the given method."""
-    print(f"\n--- {method_name.upper()} ---")
-    agg = ByzantineAggregator(method_name, 0.3)
+def run_experiment(trim_fraction, adaptive, byz_fraction, client_data, X_test, y_test, input_size):
+    """Run FL training with given config and return final accuracy."""
+    n_byzantine = int(NUM_CLIENTS * byz_fraction)
+    agg = ByzantineAggregator("trimmed_mean", trim_fraction, adaptive_trim=adaptive)
 
     rng = np.random.default_rng(SEED)
     model = SimpleMLP(input_size, rng)
     global_params = model.get_parameters()
-    accuracies = []
 
-    for r in range(NUM_ROUNDS):
+    for _ in range(NUM_ROUNDS):
         global_params = federated_round(
             global_params, client_data, agg, n_byzantine, input_size
         )
-        model.set_parameters(global_params)
-        acc = model.evaluate(X_test, y_test)
-        accuracies.append(acc)
-        print(f"  Round {r + 1:2d}: accuracy = {acc:.4f}")
 
-    return accuracies
+    model.set_parameters(global_params)
+    return model.evaluate(X_test, y_test)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Qora-FL MNIST Poisoning Demo")
-    parser.add_argument("--quick", action="store_true", help="Run a reduced number of rounds for CI/fast verification")
+    parser = argparse.ArgumentParser(description="Qora-FL Adaptive Trim Evaluation")
+    parser.add_argument("--quick", action="store_true", help="Run a reduced grid for CI/fast verification")
     args = parser.parse_args()
 
-    global NUM_ROUNDS
+    global NUM_ROUNDS, BYZANTINE_FRACTIONS
     if args.quick:
         NUM_ROUNDS = 5
+        BYZANTINE_FRACTIONS = [0.0, 0.2, 0.4]
 
     rng = np.random.default_rng(SEED)
-    n_byzantine = int(NUM_CLIENTS * BYZANTINE_FRACTION)
-
-    print("Qora-FL Poisoning Demo")
-    print("=" * 50)
-    print(f"Clients: {NUM_CLIENTS} ({n_byzantine} Byzantine, label-flipping)")
-    print(f"Rounds: {NUM_ROUNDS}, Local epochs: {LOCAL_EPOCHS}")
-    print()
-
     X_train, y_train, X_test, y_test, input_size, dataset_name = load_data()
-    print(
-        f"Dataset: {dataset_name} ({len(X_train)} train, {len(X_test)} test, "
-        f"{input_size} features)"
-    )
     client_data = partition_data(X_train, y_train, NUM_CLIENTS, rng)
 
-    # Method configs: (aggregator_method_string, display_name)
-    methods = [
-        ("fedavg", "FedAvg"),
-        ("trimmed_mean", "Trimmed Mean"),
-        ("median", "Median"),
-        (f"krum:{n_byzantine}", "Krum"),
+    configs = [
+        ("Static 0.1", 0.1, False),
+        ("Static 0.2", 0.2, False),
+        ("Static 0.3", 0.3, False),
+        ("Adaptive", 0.1, True),  # min_trim=0.1, adapts upward
     ]
 
-    results = {}
-    for method_str, display_name in methods:
-        results[display_name] = run_experiment(
-            method_str, client_data, X_test, y_test, n_byzantine, input_size
-        )
+    print(f"Adaptive Trim Evaluation ({dataset_name})")
+    print(f"{NUM_CLIENTS} clients, {NUM_ROUNDS} rounds, label-flipping attack")
+    print("=" * 78)
+    header = f"{'Byzantine %':<14}"
+    for name, _, _ in configs:
+        header += f" {name:>14}"
+    print(header)
+    print("-" * 78)
 
-    # Summary
-    print("\n" + "=" * 50)
-    print("RESULTS SUMMARY")
-    print("=" * 50)
-    fedavg_acc = results["FedAvg"][-1]
-    for name, accs in results.items():
-        delta = accs[-1] - fedavg_acc
-        delta_str = f"  ({delta:+.4f} vs FedAvg)" if name != "FedAvg" else ""
-        print(f"  {name:>15s}: final accuracy = {accs[-1]:.4f}{delta_str}")
+    for byz_frac in BYZANTINE_FRACTIONS:
+        row = f"{int(byz_frac * 100):>10}%    "
+        accs = []
+        for name, trim, adaptive in configs:
+            acc = run_experiment(trim, adaptive, byz_frac, client_data, X_test, y_test, input_size)
+            accs.append(acc)
+            row += f" {acc:>13.4f}"
+        print(row)
 
-    # Plot if matplotlib available
-    if HAS_MATPLOTLIB:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        rounds = list(range(1, NUM_ROUNDS + 1))
-
-        styles = [
-            ("FedAvg", "r--o"),
-            ("Trimmed Mean", "b-s"),
-            ("Median", "g-^"),
-            ("Krum", "m-D"),
-        ]
-        for name, style in styles:
-            if name in results:
-                ax.plot(rounds, results[name], style, label=name, alpha=0.8)
-
-        ax.set_xlabel("Federated Round")
-        ax.set_ylabel("Test Accuracy")
-        ax.set_title(
-            f"{dataset_name}: Aggregation Methods under "
-            f"{int(BYZANTINE_FRACTION*100)}% Label-Flipping Attack"
-        )
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(0, 1)
-        fig.tight_layout()
-        fig.savefig("mnist_poisoning_comparison.png", dpi=150)
-        print(f"\nPlot saved to mnist_poisoning_comparison.png")
-    else:
-        print("\nInstall matplotlib to generate comparison plot.")
+    print()
+    print("Analysis:")
+    print("  - Static 0.1: under-trims at high attack rates, over-trims at 0%")
+    print("  - Static 0.3: safe at 30% but wastes honest data at low attack rates")
+    print("  - Adaptive: starts conservative, increases trim as attackers are detected")
+    print("  - Adaptive is most useful when the attack fraction is unknown or variable")
 
 
 if __name__ == "__main__":

@@ -208,6 +208,28 @@ let avg = fedavg(&updates, None).unwrap();
 
 Trimmed mean remains stable under ~30% label-flipping and gradient-scaling attacks, converging faster and to higher accuracy than undefended FedAvg. Aggregation overhead stays under 10ms for typical FL model sizes. At larger model sizes, aggregation cost becomes memory-bound, consistent with the behavior of coordinate-wise robust aggregation methods.
 
+### Byzantine Robustness
+
+The following benchmark evaluates all aggregation methods against five common FL attacks (Label Flip, Gradient Scaling, Sign Flip, Additive Noise, ALIE) with 10–30% Byzantine clients:
+
+<p align="center">
+  <img src="docs/images/attack_evaluation.png" alt="Test accuracy vs Byzantine percentage across five attack types. FedAvg collapses under Gradient Scaling and Additive Noise attacks, while Trimmed Mean, Median, Krum, and Multi-Krum maintain 90%+ accuracy even at 30% Byzantine clients." width="100%">
+</p>
+
+**Key finding:** FedAvg drops to ~10% accuracy under gradient-based attacks. Robust aggregators maintain >90% accuracy across all attack types and Byzantine ratios.
+
+### Convergence Under Attack
+
+Under a sustained 30% label-flipping attack, robust methods converge faster and reach higher final accuracy:
+
+<p align="center">
+  <img src="docs/images/mnist_poisoning_comparison.png" alt="Test accuracy over 5 federated rounds with 30% label-flipping attackers. Trimmed Mean, Median, and Krum converge to 91-92% accuracy while FedAvg lags at lower accuracy throughout training." width="700">
+</p>
+
+**Key finding:** Robust aggregation methods not only tolerate attacks—they accelerate convergence by filtering noisy gradients.
+
+### Run Benchmarks
+
 ```bash
 # Aggregation overhead (Python)
 python examples/benchmark_overhead.py

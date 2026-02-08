@@ -16,6 +16,8 @@ import numpy as np
 
 from qora import ByzantineAggregator
 
+
+import argparse
 SIZES = [
     ("1K params", (1, 1_000)),
     ("100K params", (1, 100_000)),
@@ -54,6 +56,19 @@ def benchmark(method, n_clients, shape):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Qora-FL Aggregation Overhead Benchmark")
+    parser.add_argument("--quick", action="store_true", help="Run a reduced grid for CI/fast verification")
+    args = parser.parse_args()
+
+    global SIZES, N_WARMUP, N_RUNS
+    if args.quick:
+        SIZES = [
+            ("1K params", (1, 1_000)),
+            ("100K params", (1, 100_000)),
+        ]
+        N_WARMUP = 1
+        N_RUNS = 5
+
     print("Qora-FL Aggregation Overhead Benchmark")
     print("=" * 80)
     print(

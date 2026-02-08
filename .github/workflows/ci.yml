@@ -64,11 +64,21 @@ jobs:
       with:
         python-version: '3.11'
     - name: Install dependencies
+      working-directory: bindings/python
       run: |
         python -m venv .venv
         source .venv/bin/activate
-        pip install maturin pytest numpy
+        pip install maturin pytest numpy black flake8
+    - name: Check Python formatting (black)
       working-directory: bindings/python
+      run: |
+        source .venv/bin/activate
+        black --check .
+    - name: Lint Python code (flake8)
+      working-directory: bindings/python
+      run: |
+        source .venv/bin/activate
+        flake8 .
     - name: Build Python package
       run: |
         source .venv/bin/activate

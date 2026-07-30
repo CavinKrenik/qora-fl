@@ -184,12 +184,13 @@ mod python {
         ///
         /// Returns:
         ///     Aggregated 2D numpy array.
-        #[pyo3(signature = (updates, client_ids=None))]
+        #[pyo3(signature = (updates, client_ids=None, weights=None))]
         fn aggregate<'py>(
             &mut self,
             py: Python<'py>,
             updates: Vec<numpy::PyReadonlyArray2<'py, f32>>,
             client_ids: Option<Vec<String>>,
+            weights: Option<Vec<f32>>,
         ) -> PyResult<&'py PyArray2<f32>> {
             let rust_updates: Vec<Array2<f32>> = updates
                 .iter()
@@ -199,7 +200,7 @@ mod python {
             let ids_ref = client_ids.as_deref();
             let result = self
                 .inner
-                .aggregate(&rust_updates, ids_ref)
+                .aggregate_weighted(&rust_updates, ids_ref, weights.as_deref())
                 .map_err(qora_err)?;
             Ok(result.into_pyarray(py))
         }

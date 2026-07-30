@@ -22,7 +22,7 @@ Qora-FL is designed as **infrastructure**, emphasizing:
 - **Explicit aggregation semantics** -- each method has documented tolerance bounds, not just "robust"
 - **Measurable deviation signals** -- reputation is derived from observable behavior, not assumed trust
 - **Deterministic execution paths** -- BFP-16 block floating-point for deterministic Krum/Multi-Krum distance computation
-- **Ecosystem integration** -- drop-in Flower strategy, not a standalone experiment
+- **Ecosystem integration** -- Flower-compatible strategy adapter, not a standalone experiment
 - **Benchmarked overhead** -- sub-10ms aggregation for 100K parameters, not just accuracy claims
 
 | Feature | FedAvg | Typical Robust FL | Qora-FL |
@@ -30,7 +30,7 @@ Qora-FL is designed as **infrastructure**, emphasizing:
 | Byzantine tolerance | -- | Paper-only | Algorithms informed by 181-day QRES deployment |
 | Deterministic option | -- | -- | BFP-16 block floating-point |
 | Reputation tracking | -- | -- | Deviation-derived, persistent |
-| Flower integration | Native | -- | Drop-in `QoraStrategy` |
+| Flower integration | Native | -- | `QoraStrategy` adapter |
 | Benchmarked overhead | -- | -- | <10ms / 100K params |
 | Production API | Partial | -- | Rust core + Python bindings |
 

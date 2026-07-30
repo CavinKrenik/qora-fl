@@ -55,8 +55,16 @@ jobs:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   python:
-    name: Python bindings
+    name: Python bindings (flwr ${{ matrix.flwr }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The declared support range is >=1.5,<2. Both ends are pinned and
+        # tested: a single unpinned install would only ever exercise whichever
+        # version the resolver picked that day, which is not evidence for the
+        # range. Bump the upper pin deliberately when adopting a newer 1.x.
+        flwr: ['1.5.0', '1.32.1']
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
@@ -69,6 +77,7 @@ jobs:
         python -m venv .venv
         source .venv/bin/activate
         pip install maturin pytest numpy black flake8
+        pip install 'flwr==${{ matrix.flwr }}'
     - name: Check Python formatting (black)
       working-directory: bindings/python
       run: |
@@ -84,6 +93,11 @@ jobs:
         source .venv/bin/activate
         maturin develop --features python
       working-directory: bindings/python
+    - name: Import smoke test
+      working-directory: bindings/python
+      run: |
+        source .venv/bin/activate
+        python -c "import flwr; from qora import QoraStrategy; print(flwr.__version__, QoraStrategy)"
     - name: Run pytest
       working-directory: bindings/python
       run: |

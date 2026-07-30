@@ -17,6 +17,19 @@ release is actually cut; the API migrations recorded below take effect in
 
 ### Fixed
 
+- **The Flower adapter aggregated and updated reputation per layer instead of
+  once per complete client model.** Each layer was passed to the aggregator in
+  a separate call, so a selection method could choose a *different client for
+  each layer* and return a model no client submitted. Reputation was computed
+  from the first layer only, which let a client match the cohort on layer 0 and
+  deviate arbitrarily on every later layer without penalty. Complete models are
+  now flattened into one update, aggregated in a single call, and split back
+  into their original layer shapes.
+- **Flower is now installed in Python CI**, so `QoraStrategy` is imported and
+  exercised against real `FitRes`, `Status`, and `Parameters` types. The
+  adapter previously had no CI coverage at all -- the job never installed
+  Flower, so the import could not even be attempted.
+
 - **Multi-Krum now enforces its documented selection bound
   `1 <= m <= n - 2f - 2`** (Blanchard et al., 2017). `aggregate_multi_krum_bfp16`
   previously clamped with `m.max(1).min(n)`, so an oversized `m` returned a
@@ -80,6 +93,78 @@ release is actually cut; the API migrations recorded below take effect in
   clients, because `update_reputations` zips and stops at the shorter side.
 
 ### Changed
+
+- **The Flower strategy now validates complete client model structures**,
+  aggregates each client model as one flattened update, and restores the
+  original layer shapes afterward. Every client is checked against the first
+  as structural reference: layer count, per-layer shape, floating-point dtype,
+  and finiteness. A model with the same total element count but a different
+  layer structure -- `[(10, 4), (4,)]` versus `[(44,)]` -- is refused rather
+  than reconciled by broadcasting.
+
+  A malformed *successful* result raises `ValueError` rather than being
+  dropped. Silently discarding it would change the round's effective
+  adversarial fraction, which is exactly the quantity Krum's `n >= 2f + 3`
+  condition is stated over. Messages name the client and layer index.
+
+  **Migration:** **integer parameter arrays are now rejected.** Only
+  floating-point dtypes are accepted; `float64` is converted to `float32` and
+  its extra precision is not preserved. Integer arrays were previously coerced
+  into trainable floating-point parameters without comment. A deployment
+  sending integer layers will now see a `ValueError` naming the client and
+  layer rather than silently different aggregation.
+
+- **Flower FedAvg now weights updates by each result's `num_examples`.** New
+  `ByzantineAggregator::aggregate_weighted` carries the weights to the Rust
+  `fedavg`, which already accepted them but was always called with `None`.
+  Weights are filtered alongside updates when reputation gating removes a
+  client, so they cannot be applied to the wrong participant.
+
+- **Robust methods continue to treat accepted client updates equally.**
+  `num_examples` weighting applies to FedAvg only; supplying weights with any
+  other method returns the new `QoraError::WeightsNotSupported` rather than
+  being silently ignored. Reweighting a median or trimmed mean by claimed
+  sample count would hand an attacker proportional influence simply for
+  claiming a large dataset -- a change to the threat model, not a detail.
+
+- **The strategy now honors `accept_failures`.** Reported failures refuse the
+  round when it is False, returning `(None, {})` without invoking Rust,
+  moving reputation, or calling the metrics callback. Previously the parameter
+  was inherited from `FedAvg` and ignored.
+
+- **Reputation gating and updates are performed once, by the Rust aggregator,
+  using each client's complete model update.** The adapter's second,
+  Python-side reputation filter is removed. It used its own threshold
+  comparison and its own fail-open fallback, which masked
+  `AllUpdatesRejected` and could apply reputation twice.
+
+- **Metrics are aggregated only through `fit_metrics_aggregation_fn`.** When
+  none is configured the strategy returns `{}`. The previous `qora_round`,
+  `qora_num_clients`, `qora_num_filtered`, and per-client `reputation_<cid>`
+  entries are no longer emitted: they invented an aggregation policy for
+  arbitrary metric names and grew one entry per client per round. Reputation
+  remains available through `QoraStrategy.get_reputation`.
+
+- Python `ByzantineAggregator.aggregate` accepts an optional `weights`
+  argument. Existing two-argument calls are unaffected.
+
+- **Flower remains an optional dependency, installed via `qora-fl[flower]`.**
+  `import qora` and the whole core API -- `ByzantineAggregator`,
+  `ReputationManager` -- work with Flower absent; only `qora.QoraStrategy`
+  requires it, and raises an `ImportError` naming the extra when it is
+  missing. Verified by installing the built wheel without the extra into a
+  clean environment.
+
+  The extra is now bounded: **supported range `flwr>=1.5,<2`**, upper-bounded
+  because the adapter targets Flower's 1.x strategy interface. **Tested in CI:
+  1.5.0 and 1.32.1** -- the workflow runs a matrix over both ends of the range
+  rather than installing whichever version a resolver picks, which would be no
+  evidence for the range at all. Versions in between are covered by the
+  declared promise but are not individually exercised.
+
+- The adapter is described as a "Flower-compatible strategy adapter" rather
+  than a "drop-in" replacement, in both READMEs. It does not reproduce every
+  behavior of Flower's built-in `FedAvg`.
 
 - **Reputation state now maintains a numeric invariant: every stored score is
   finite and within `[0, 1]`, and every operation preserves it.** Each mutation

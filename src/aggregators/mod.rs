@@ -130,6 +130,13 @@ impl ByzantineAggregator {
     ///
     /// Clients whose reputation falls below `ban_threshold` are excluded
     /// from aggregation when `client_ids` are provided.
+    ///
+    /// Gating fails closed: a round in which no client clears the threshold
+    /// returns [`QoraError::AllUpdatesRejected`] rather than falling back to
+    /// the full cohort. Note that unknown clients start at
+    /// [`crate::reputation::store::DEFAULT_SCORE`] (0.5), so a threshold above
+    /// that rejects every first-time participant -- which is now an error
+    /// rather than a silently ungated round.
     pub fn with_ban_threshold(
         method: AggregationMethod,
         trim_fraction: f32,
@@ -156,7 +163,11 @@ impl ByzantineAggregator {
     ///
     /// When `client_ids` are provided and `ban_threshold > 0`, clients whose
     /// reputation is below the threshold are excluded before aggregation.
-    /// If all clients would be excluded, the filter is bypassed (fail-open).
+    ///
+    /// If gating rejects *every* submitted client the round fails with
+    /// [`QoraError::AllUpdatesRejected`]. Rejected clients are never
+    /// automatically restored: a client the configured policy excluded stays
+    /// excluded even when no other client qualifies either.
     ///
     /// # Arguments
     ///
@@ -165,9 +176,16 @@ impl ByzantineAggregator {
     ///
     /// # Errors
     ///
+    /// Checked in this order, so malformed input is never masked by a policy
+    /// rejection:
+    ///
+    /// * [`QoraError::EmptyUpdates`] if `updates` is empty.
+    /// * [`QoraError::DimensionMismatch`] if update shapes disagree.
     /// * [`QoraError::NonFiniteValue`] if any update contains NaN or infinity.
     /// * [`QoraError::ClientIdCountMismatch`] if `client_ids` is supplied and
     ///   its length differs from `updates`.
+    /// * [`QoraError::AllUpdatesRejected`] if reputation gating leaves no
+    ///   client.
     /// * [`QoraError::InsufficientQuorum`] for Krum and Multi-Krum when
     ///   `n < 2f + 3`.
     pub fn aggregate(
@@ -195,15 +213,22 @@ impl ByzantineAggregator {
                         .map(|(i, _)| i)
                         .collect();
 
+                    // Fail closed. Reinstating the rejected clients here would
+                    // defeat the gate exactly when reputation distrusts the
+                    // whole cohort -- the one round where the policy matters
+                    // most. Returning before any aggregation also means no
+                    // score moves on this path.
                     if active.is_empty() {
-                        // Fail-open: use all clients rather than empty aggregation
-                        (updates.to_vec(), Some(ids.to_vec()))
-                    } else {
-                        let u: Vec<Array2<f32>> =
-                            active.iter().map(|&i| updates[i].clone()).collect();
-                        let new_ids: Vec<String> = active.iter().map(|&i| ids[i].clone()).collect();
-                        (u, Some(new_ids))
+                        return Err(QoraError::AllUpdatesRejected {
+                            total: updates.len(),
+                            rejected: ids.len() - active.len(),
+                            threshold: self.ban_threshold,
+                        });
                     }
+
+                    let u: Vec<Array2<f32>> = active.iter().map(|&i| updates[i].clone()).collect();
+                    let new_ids: Vec<String> = active.iter().map(|&i| ids[i].clone()).collect();
+                    (u, Some(new_ids))
                 } else {
                     (updates.to_vec(), None)
                 }

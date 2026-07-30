@@ -74,6 +74,24 @@ contradicted it.
 
 ### Changed
 
+- **Reputation participation gating now fails closed.** When every submitted
+  client is below the configured `ban_threshold`, aggregation returns the new
+  `QoraError::AllUpdatesRejected { total, rejected, threshold }` instead of
+  silently restoring the banned clients and aggregating them anyway.
+
+  The previous fallback defeated the gate in the one round where it mattered
+  most -- the round where reputation distrusted the entire cohort. A client the
+  configured policy rejected is no longer reinstated merely because no other
+  client qualified either.
+
+  The error path performs no aggregation and moves no reputation scores, so a
+  caller retrying a rejected round does not compound penalties. Gating still
+  applies only when `client_ids` are supplied and `ban_threshold > 0`, so
+  callers using the default constructor, or aggregating without client IDs,
+  are unaffected. Note that unknown clients start at 0.5: a threshold above
+  that now rejects a first-round cohort outright rather than passing it
+  through ungated.
+
 - **Krum and Multi-Krum now refuse inputs violating `n >= 2f + 3`.**
   `aggregate_krum` and `aggregate_krum_bfp16` return `None`;
   `ByzantineAggregator` reports `QoraError::InsufficientQuorum` with the
@@ -152,6 +170,13 @@ contradicted it.
   `verification`.
 - `QoraError::InvalidMultiKrumSelection { clients, byzantine, selected,
   maximum }` -- raised for an explicit `m` outside the safe range.
+- `QoraError::AllUpdatesRejected { total, rejected, threshold }` -- raised when
+  reputation gating leaves no client.
+- `tests/reputation_gating.rs`: 12 integration tests covering the typed error
+  and its fields, non-restoration of a partially rejected cohort, precedence
+  over method execution, reputation state being unchanged on the error path,
+  and validation still outranking gating. Five Python tests cover the same
+  behavior through the bindings.
 - `tests/multi_krum_bounds.rs`: 13 integration tests covering the cap applied
   to an omitted `m`, rejection of explicit out-of-range values, quorum
   precedence, low-level `None` returns, and serde round-trips of both forms.

@@ -6,6 +6,7 @@
 use ndarray::Array2;
 use rayon::prelude::*;
 
+use super::validate::validate_updates;
 use crate::error::QoraError;
 
 /// Coordinate-wise median aggregation.
@@ -21,18 +22,16 @@ use crate::error::QoraError;
 /// # Arguments
 ///
 /// * `updates` - Client model updates as 2D arrays (one per client)
+///
+/// # Errors
+///
+/// Returns [`QoraError::NonFiniteValue`] if any update contains NaN or
+/// infinity. NaN compares unordered, which would silently corrupt the
+/// coordinate sort that the median depends on.
 pub fn median(updates: &[Array2<f32>]) -> Result<Array2<f32>, QoraError> {
-    if updates.is_empty() {
-        return Err(QoraError::EmptyUpdates);
-    }
+    validate_updates(updates)?;
 
     let dim = updates[0].dim();
-    for update in &updates[1..] {
-        if update.dim() != dim {
-            return Err(QoraError::DimensionMismatch);
-        }
-    }
-
     let (nrows, ncols) = dim;
     let n_params = nrows * ncols;
 
@@ -44,6 +43,8 @@ pub fn median(updates: &[Array2<f32>]) -> Result<Array2<f32>, QoraError> {
 
             let mut values: Vec<f32> = updates.iter().map(|update| update[[row, col]]).collect();
 
+            // validate_updates guarantees all values are finite, so partial_cmp
+            // never returns None here; the fallback is defensive only.
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
             let mid = values.len() / 2;

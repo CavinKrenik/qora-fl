@@ -9,6 +9,8 @@ use fixed::types::I16F16;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::verification::krum_condition::krum_condition_met;
+
 /// Block Floating Point Vector (BFP-16)
 /// Solves the "vanishing update" problem for low learning rates by using
 /// a shared exponent for the entire vector.
@@ -22,7 +24,31 @@ pub struct Bfp16Vec {
 }
 
 impl Bfp16Vec {
-    /// Create Bfp16Vec from f32 slice
+    /// Create Bfp16Vec from f32 slice.
+    ///
+    /// # Assumes finite input
+    ///
+    /// This function **assumes `data` contains no NaN or infinity** and does
+    /// not check. Callers inside this crate satisfy that via
+    /// [`crate::aggregators::validate::validate_updates`], which
+    /// [`crate::ByzantineAggregator::aggregate`] runs before encoding.
+    ///
+    /// Non-finite input is silently laundered rather than rejected:
+    ///
+    /// - **NaN** is ignored by the `max_abs` reduction (`f32::max` returns the
+    ///   non-NaN operand) and then quantizes to a **zero mantissa**, because
+    ///   `f32 as i16` saturates NaN to `0`. A NaN coordinate therefore reads as
+    ///   `0.0` to the distance metric, which can make a poisoned vector appear
+    ///   *closer* to the honest cluster than a genuine outlier -- while
+    ///   [`crate::ByzantineAggregator`] still returns the original, NaN-bearing
+    ///   f32 array if that vector is selected.
+    /// - **Infinity** saturates the shared exponent to 126, which quantizes
+    ///   every other coordinate in the vector to zero.
+    ///
+    /// Because this method is public, it remains a laundering entrance for
+    /// callers who bypass the aggregator. Changing the signature to
+    /// `Result<Self, QoraError>` would close it, but that is a breaking API
+    /// change and is deliberately deferred.
     pub fn from_f32_slice(data: &[f32]) -> Self {
         if data.is_empty() {
             return Self {
@@ -146,32 +172,26 @@ pub fn dist_sq_bfp16(a: &Bfp16Vec, b: &Bfp16Vec) -> i64 {
 ///
 /// # Returns
 /// * `Some(Vec<I16F16>)` - The selected representative vector (cloned)
-/// * `None` - If aggregation is mathematically impossible (n < 3)
+/// * `None` - If Krum's condition `n >= 2f + 3` is not met
 ///
 /// # Krum Condition
-/// The algorithm requires `n >= 2f + 3`. If this condition is not met,
-/// the algorithm proceeds with best-effort selection using clamped neighbor count.
+/// The algorithm requires `n >= 2f + 3` and returns `None` when that is not
+/// satisfied. Earlier versions logged a warning and proceeded with a clamped
+/// neighbor count; that "best-effort" result carried no Byzantine guarantee
+/// while looking indistinguishable from a sound one, so it is now refused.
+/// Use [`crate::verification::max_tolerable_f`] to pick a valid `f` for a
+/// given `n`.
 pub fn aggregate_krum(vectors: &[Vec<I16F16>], f: usize) -> Option<Vec<I16F16>> {
     let n = vectors.len();
 
-    // Krum requires at least n=3 (with f=0, needs n-f-2=1 neighbor)
-    if n < 3 {
+    // Subsumes the n >= 3 floor: at f=0 the condition is n >= 3.
+    if !krum_condition_met(n, f) {
         return None;
     }
 
-    // Theoretical requirement is n >= 2f + 3.
-    // If not met, we proceed best-effort but warn.
-    if n < 2 * f + 3 {
-        eprintln!(
-            "WARN: Krum condition not met (n={} < 2*f+3={}). Proceeding with best-effort.",
-            n,
-            2 * f + 3
-        );
-    }
-
-    // Number of neighbors to consider for the score: k = n - f - 2
-    // If n is too small relative to f, ensure we define a valid range.
-    let k = if n > f + 2 { n - f - 2 } else { 1 };
+    // Number of neighbors to consider for the score: k = n - f - 2.
+    // The condition above guarantees n >= 2f + 3, hence k >= f + 1 >= 1.
+    let k = n - f - 2;
 
     let mut min_score = I16F16::MAX;
     let mut best_idx = 0;
@@ -212,23 +232,17 @@ pub fn aggregate_krum(vectors: &[Vec<I16F16>], f: usize) -> Option<Vec<I16F16>> 
 /// Each vector's score is the sum of squared distances to its `k = n - f - 2`
 /// nearest neighbors, computed in parallel via rayon.
 ///
-/// Returns `None` if `n < 3`.
+/// Returns `None` if Krum's condition `n >= 2f + 3` is not met.
 fn compute_krum_scores_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<Vec<(usize, i64)>> {
     let n = vectors.len();
 
-    if n < 3 {
+    // Subsumes the n >= 3 floor: at f=0 the condition is n >= 3.
+    if !krum_condition_met(n, f) {
         return None;
     }
 
-    if n < 2 * f + 3 {
-        eprintln!(
-            "WARN: Krum condition not met (n={} < 2*f+3={}). Proceeding with best-effort.",
-            n,
-            2 * f + 3
-        );
-    }
-
-    let k = if n > f + 2 { n - f - 2 } else { 1 };
+    // The condition above guarantees n >= 2f + 3, hence k >= f + 1 >= 1.
+    let k = n - f - 2;
 
     let scores: Vec<(usize, i64)> = (0..n)
         .into_par_iter()
@@ -257,11 +271,17 @@ fn compute_krum_scores_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<Vec<(usiz
 /// handling the full f32 range without the I16F16 overflow/underflow issues.
 /// The outer score loop is parallelized with rayon.
 ///
-/// Returns `Some(index)` of the selected vector, or `None` if n < 3.
+/// Returns `Some(index)` of the selected vector, or `None` if Krum's
+/// condition `n >= 2f + 3` is not met.
 ///
 /// # Arguments
 /// * `vectors` - BFP-16 encoded model update vectors
 /// * `f` - Maximum number of Byzantine nodes expected
+///
+/// # Note
+/// This takes already-encoded vectors, so finiteness is not checkable here.
+/// The non-finite check must happen before [`Bfp16Vec::from_f32_slice`] --
+/// see its documentation for what encoding does to NaN and infinity.
 pub fn aggregate_krum_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<usize> {
     let scores = compute_krum_scores_bfp16(vectors, f)?;
     scores

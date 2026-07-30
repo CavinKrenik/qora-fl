@@ -11,5 +11,5 @@ pub mod krum_condition;
 pub mod norm_bound;
 
 pub use audit::{AggregationAuditEntry, AuditLog};
-pub use krum_condition::{krum_condition_met, max_tolerable_f};
+pub use krum_condition::{krum_condition_met, krum_min_clients, max_tolerable_f};
 pub use norm_bound::{check_norm_bound, filter_by_norm_bound};

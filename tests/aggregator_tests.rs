@@ -392,19 +392,23 @@ fn test_krum_at_exact_boundary() {
 }
 
 #[test]
-fn test_krum_below_2f3_best_effort() {
-    // n=4, f=2 -> 2f+3=7, so n < 2f+3. Should still return a result (best-effort).
+fn test_krum_below_2f3_is_refused() {
+    // n=4, f=2 -> 2f+3=7, so n < 2f+3.
+    //
+    // This previously returned Some(_) as a "best-effort" result with a stderr
+    // warning. That result carried no Byzantine guarantee while being
+    // indistinguishable from a sound one, so it is now refused outright.
+    // With f=2 and only 4 vectors, two of which are the 100.0 outliers, there
+    // is no honest majority to recover -- answering at all was the bug.
     let vectors = vec![
         vec![I16F16::from_num(1.0)],
         vec![I16F16::from_num(1.1)],
         vec![I16F16::from_num(100.0)],
         vec![I16F16::from_num(100.0)],
     ];
-    // Should return Some (best-effort), not None
-    let result = aggregate_krum(&vectors, 2);
     assert!(
-        result.is_some(),
-        "Krum below 2f+3 should still return best-effort result"
+        aggregate_krum(&vectors, 2).is_none(),
+        "Krum below n >= 2f+3 must be refused, not answered best-effort"
     );
 }
 

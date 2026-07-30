@@ -6,6 +6,7 @@
 
 use ndarray::Array2;
 
+use super::validate::{validate_updates, validate_weights};
 use crate::error::QoraError;
 
 /// Standard FedAvg aggregation (no Byzantine defense).
@@ -17,23 +18,25 @@ use crate::error::QoraError;
 ///
 /// * `updates` - Client model updates as 2D arrays (one per client)
 /// * `weights` - Optional client weights (e.g., proportional to dataset size)
+///
+/// # Errors
+///
+/// Returns [`QoraError::NonFiniteValue`] if any update contains NaN or
+/// infinity, or [`QoraError::NonFiniteWeight`] if any weight does. FedAvg
+/// propagates non-finite values directly into every output coordinate, so a
+/// single bad value from one client -- or a single bad weight -- destroys the
+/// entire aggregate.
 pub fn fedavg(updates: &[Array2<f32>], weights: Option<&[f32]>) -> Result<Array2<f32>, QoraError> {
-    if updates.is_empty() {
-        return Err(QoraError::EmptyUpdates);
-    }
+    validate_updates(updates)?;
 
     let dim = updates[0].dim();
-    for update in &updates[1..] {
-        if update.dim() != dim {
-            return Err(QoraError::DimensionMismatch);
-        }
-    }
 
     match weights {
         Some(w) => {
             if w.len() != updates.len() {
                 return Err(QoraError::DimensionMismatch);
             }
+            validate_weights(w)?;
             let weight_sum: f32 = w.iter().sum();
             if weight_sum == 0.0 {
                 return Err(QoraError::InsufficientQuorum {

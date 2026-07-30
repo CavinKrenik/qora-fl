@@ -16,6 +16,7 @@ pub mod fedavg;
 pub mod krum;
 pub mod median;
 pub mod trimmed_mean;
+pub mod validate;
 
 pub use fedavg::fedavg;
 pub use krum::aggregate_krum;
@@ -23,6 +24,7 @@ pub use krum::aggregate_krum_bfp16;
 pub use krum::aggregate_multi_krum_bfp16;
 pub use median::median;
 pub use trimmed_mean::trimmed_mean;
+pub use validate::validate_updates;
 
 use ndarray::Array2;
 
@@ -30,6 +32,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::QoraError;
 use crate::reputation::ReputationStore;
+use crate::verification::krum_condition::krum_min_clients;
+use validate::validate_client_ids;
 
 /// Aggregation method selection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -144,11 +148,28 @@ impl ByzantineAggregator {
     ///
     /// * `updates` - Client model updates as 2D arrays
     /// * `client_ids` - Optional client identifiers for reputation tracking
+    ///
+    /// # Errors
+    ///
+    /// * [`QoraError::NonFiniteValue`] if any update contains NaN or infinity.
+    /// * [`QoraError::ClientIdCountMismatch`] if `client_ids` is supplied and
+    ///   its length differs from `updates`.
+    /// * [`QoraError::InsufficientQuorum`] for Krum and Multi-Krum when
+    ///   `n < 2f + 3`.
     pub fn aggregate(
         &mut self,
         updates: &[Array2<f32>],
         client_ids: Option<&[String]>,
     ) -> Result<Array2<f32>, QoraError> {
+        // Validate before anything else. Two reasons this must come first:
+        // the ban filter below indexes `updates` with positions derived from
+        // `client_ids` (a length mismatch would panic), and non-finite values
+        // are invisible to reputation tracking -- a NaN distance satisfies
+        // neither the reward nor the penalty branch, so a NaN attacker would
+        // otherwise be both unpenalized and unbannable.
+        validate_updates(updates)?;
+        validate_client_ids(updates, client_ids)?;
+
         // Filter banned clients if reputation gating is enabled
         let (filtered_updates, filtered_ids): (Vec<Array2<f32>>, Option<Vec<String>>) =
             if self.ban_threshold > 0.0 {
@@ -205,7 +226,7 @@ impl ByzantineAggregator {
 
                 let best_idx =
                     aggregate_krum_bfp16(&bfp_vecs, f).ok_or(QoraError::InsufficientQuorum {
-                        needed: 3,
+                        needed: krum_min_clients(f),
                         actual: agg_updates.len(),
                     })?;
 
@@ -222,7 +243,7 @@ impl ByzantineAggregator {
 
                 let indices = aggregate_multi_krum_bfp16(&bfp_vecs, f, m).ok_or(
                     QoraError::InsufficientQuorum {
-                        needed: 3,
+                        needed: krum_min_clients(f),
                         actual: agg_updates.len(),
                     },
                 )?;

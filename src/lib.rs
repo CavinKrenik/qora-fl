@@ -19,10 +19,17 @@
 //!
 //! Use [`ByzantineAggregator`] for a convenient interface with built-in
 //! reputation tracking.
+//!
+//! ## Audit schema
+//!
+//! [`audit`] defines an experimental, caller-owned record of what an
+//! aggregation attempt decided about each update. Qora-FL does not persist
+//! audit records, and the primary aggregation API does not yet return them.
 
 #![deny(missing_docs)]
 
 pub mod aggregators;
+pub mod audit;
 pub mod error;
 pub mod math;
 pub mod reputation;
@@ -42,6 +49,10 @@ pub use aggregators::fedavg;
 pub use aggregators::median;
 pub use aggregators::trimmed_mean;
 pub use aggregators::{AggregationMethod, ByzantineAggregator};
+pub use audit::{
+    AggregationAuditDecision, AggregationAuditEntry, AggregationAuditOutcome, AggregationDecision,
+    AggregationRejectionReason, AuditedAggregationMethod, AGGREGATION_AUDIT_SCHEMA_VERSION,
+};
 pub use error::QoraError;
 pub use reputation::ReputationStore;
 pub use reputation::ReputationTracker;

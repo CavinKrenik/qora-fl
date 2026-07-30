@@ -185,6 +185,17 @@ pub enum QoraError {
         method: String,
     },
 
+    /// An audit entry does not describe a possible aggregation attempt
+    ///
+    /// Raised on construction and on deserialization. The message is a
+    /// developer-facing description of which invariant failed; it is not part
+    /// of the audit schema's machine-readable contract.
+    #[error("invalid audit entry: {reason}")]
+    InvalidAuditEntry {
+        /// Which invariant was violated
+        reason: String,
+    },
+
     /// Error in reputation tracking
     #[error("Reputation error: {0}")]
     ReputationError(String),

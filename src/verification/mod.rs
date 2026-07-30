@@ -20,6 +20,9 @@ pub mod audit;
 pub mod krum_condition;
 pub mod norm_bound;
 
+// Scoped to this one statement so no other deprecated use can hide behind it.
+// Callers reaching these through `verification::` still get the warning.
+#[allow(deprecated)]
 pub use audit::{AggregationAuditEntry, AuditLog};
 pub use krum_condition::{krum_condition_met, krum_min_clients, max_multi_krum_m, max_tolerable_f};
 pub use norm_bound::check_norm_bound;

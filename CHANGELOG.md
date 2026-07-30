@@ -94,6 +94,23 @@ that exists in this repository.
 
 ### Deprecated
 
+- Deprecated `verification::audit::AggregationAuditEntry` in favor of the new
+  root-level `AggregationAuditEntry` schema. The two are different types that
+  happen to share a name, and **their serialized shapes are not compatible**:
+  the legacy record holds `round`, `n_clients`, `n_excluded`, a free-form
+  `method` string, and `trim_fraction`, while the new one holds a schema
+  version, the full `AggregationMethod`, a per-update decision list, and an
+  outcome. Stored legacy records cannot be read as the new type; there is no
+  automatic migration.
+- Deprecated `verification::audit::AuditLog`. Audit persistence is now
+  caller-owned and **no replacement storage implementation is provided** --
+  serialize `AggregationAuditEntry` and store the records with whatever the
+  application already uses.
+
+  Neither type is removed, so 0.3 callers keep compiling; both will be removed
+  in a future breaking release. The `verification::` re-export carries a
+  statement-scoped `#[allow(deprecated)]` so the re-export itself does not warn
+  while callers reaching the types through it still do.
 - `filter_by_norm_bound` is deprecated because it silently discards
   verification errors. Callers should use `check_norm_bound` and handle each
   result explicitly.
@@ -389,6 +406,58 @@ that exists in this repository.
   `verification`.
 - `QoraError::InvalidMultiKrumSelection { clients, byzantine, selected,
   maximum }` -- raised for an explicit `m` outside the safe range.
+- **Experimental, versioned `AggregationAuditEntry` schema** (`src/audit.rs`)
+  for recording per-update acceptance and rejection decisions. Audit records
+  are caller-owned: Qora-FL does not persist them, does not retain them inside
+  `ByzantineAggregator`, and the aggregation API does not yet return them.
+  Integration is future work.
+
+  One `AggregationAuditDecision` per submitted update, carrying its original
+  index, an optional client ID, and a typed `AggregationDecision` -- so every
+  input has exactly one disposition and the counts are derived rather than
+  stored alongside. Rejection reasons are typed
+  (`AggregationRejectionReason::{ReputationBelowThreshold, NormBoundExceeded}`)
+  rather than strings; the norm is `f64`, matching `check_norm_bound`.
+  `AggregationAuditOutcome` distinguishes `Aggregated` from
+  `AllUpdatesRejected`, so a round that produced nothing can still explain why.
+
+  `method` records the **effective** parameters via the new
+  `AuditedAggregationMethod`, not the configuration-only `AggregationMethod`.
+  Two methods resolve parameters at aggregation time, and a record of the
+  configuration alone cannot explain what ran: under `adaptive_trim` the trim
+  fraction is recomputed each round, and `AggregationMethod::TrimmedMean`
+  carries no fraction at all; a bare `"multi_krum"` resolves `m` to
+  `min(3, n - 2f - 2)`. The descriptor keeps both sides -- `configured` and
+  `effective` trim fractions with an `adaptive` flag, and `requested_m`
+  alongside `effective_m` -- so a reader can tell a deliberate setting from a
+  runtime resolution. Being an enum, it also makes nonsense combinations such
+  as a FedAvg record carrying a trim fraction unrepresentable.
+
+  Method parameters are validated too: trim fractions must be finite and
+  within `0.0..=0.5`, a non-adaptive record must apply its configured fraction,
+  `2f + 3` must not overflow, `effective_m` must be at least 1, and an explicit
+  `requested_m` must equal `effective_m` -- an explicit request is honored
+  exactly or refused, never silently resolved to something else.
+  `effective_m` is deliberately not checked against the cohort size, which the
+  entry does not know.
+
+  Entries carry no timestamps, round numbers, experiment identifiers, or model
+  data -- the library has no clock, no notion of a training round, and no
+  reason to copy update values into a record. Callers wrap the entry in their
+  own structure when they need those.
+
+  Invariants (one decision per update, contiguous indices, outcome consistent
+  with the accepted count, finite in-range measurements) are enforced on
+  construction *and* deserialization, so an entry cannot describe an
+  impossible attempt. `AGGREGATION_AUDIT_SCHEMA_VERSION` versions the
+  serialized shape, not the package; the rejection-reason and outcome enums are
+  `#[non_exhaustive]`. Wire stability is not promised while the schema is
+  experimental, and a serializable record is not a tamper-proof audit log.
+
+  The pre-existing `verification::audit` types are unchanged and remain unused;
+  they are documented as superseded.
+- `QoraError::InvalidAuditEntry { reason }` -- raised when an audit entry would
+  not describe a possible aggregation attempt.
 - `QoraError::AllUpdatesRejected { total, rejected, threshold }` -- raised when
   reputation gating leaves no client.
 - `QoraError::InvalidReputationScore`, `InvalidReputationAdjustment`,

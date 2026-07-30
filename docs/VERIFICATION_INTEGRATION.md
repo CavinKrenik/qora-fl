@@ -120,8 +120,34 @@ hand-written log can contain duplicate, out-of-order, or missing round numbers
 
 **Policy:** do not wire the current struct. Adding fields after it is in use is
 a breaking change to any serialized log. Settle the schema first, and include at
-minimum a timestamp, excluded client IDs with reasons, method parameters, and an
-outcome (success/failure + error).
+minimum excluded client IDs with reasons, method parameters, and an outcome.
+
+> **Amended 2026-07-30.** This section originally also called for a
+> *timestamp*. That requirement is withdrawn: the library has no clock and no
+> notion of a training round, so generating either would invent information and
+> add a time dependency to the core crate. Timestamps, round numbers, and
+> experiment identifiers are caller concerns -- a caller wraps the entry in
+> their own record. The rest of the policy stands.
+>
+> Superseded by [`src/audit.rs`](../src/audit.rs), which implements the settled
+> schema: `schema_version`, an effective-method descriptor, one
+> `AggregationAuditDecision` per submitted update carrying its original index,
+> optional client ID, and typed disposition, plus an `outcome` distinguishing
+> `Aggregated` from `AllUpdatesRejected`.
+>
+> Entries record **the effective aggregation method parameters used for the
+> attempt**, including the effective trim fraction and the resolved Multi-Krum
+> selection count. Where runtime resolution occurs, the entry preserves both
+> the requested configuration and the effective value. This is why the schema
+> uses `AuditedAggregationMethod` rather than the configuration-only
+> `AggregationMethod`: under `adaptive_trim` the fraction is recomputed each
+> round and the configuration enum carries no fraction at all, and a bare
+> `"multi_krum"` resolves `m` at aggregation time. A record naming only the
+> configured method could not say what actually ran.
+>
+> The legacy `verification::audit` types are deprecated in favour of the new
+> schema. They are not removed, and their serialized shape is **not**
+> compatible with it.
 
 ## 5. Growth and persistence
 
@@ -267,7 +293,9 @@ Two related sub-cases must also be decided at implementation time:
 - [ ] Fix the `check_norm_bound` f32 overflow and error-variant issues. This is
       the gate on everything else: no integration work starts until standalone
       behavior is correct.
-- [ ] Decide the `AggregationAuditEntry` schema (breaking to change later).
+- [x] ~~Decide the `AggregationAuditEntry` schema~~ -- settled and implemented
+      in [`src/audit.rs`](../src/audit.rs) as a caller-owned, versioned record.
+      Not produced by any aggregation path yet.
 - [ ] Add the all-rejected `QoraError` variant.
 - [x] ~~Decide whether `filter_by_norm_bound` is deprecated or removed~~ —
       deprecated in place, removal deferred to a later breaking release.

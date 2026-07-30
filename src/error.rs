@@ -171,6 +171,20 @@ pub enum QoraError {
         value: f64,
     },
 
+    /// Per-client weights were supplied for a method that does not use them
+    ///
+    /// Only FedAvg weights by sample count. The robust methods operate on
+    /// client updates rather than per-sample votes, so reweighting them would
+    /// change their Byzantine guarantee: an attacker claiming a large sample
+    /// count would gain proportional influence over a median or trimmed mean.
+    /// Weights are refused there rather than silently ignored, so a caller
+    /// cannot believe they applied.
+    #[error("weights are only supported by FedAvg, not {method}")]
+    WeightsNotSupported {
+        /// The configured aggregation method
+        method: String,
+    },
+
     /// Error in reputation tracking
     #[error("Reputation error: {0}")]
     ReputationError(String),

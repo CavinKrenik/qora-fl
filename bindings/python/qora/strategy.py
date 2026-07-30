@@ -1,8 +1,34 @@
-"""Flower integration for Qora-FL Byzantine-tolerant federated learning.
+"""Flower-compatible strategy adapter for Qora-FL.
 
-Provides QoraStrategy, a drop-in replacement for FedAvg that uses
-Byzantine-tolerant aggregation (trimmed mean, median) to handle
-up to 30% malicious clients.
+Connects a Flower federated-learning workflow to the Rust aggregation core.
+The adapter is experimental and does not reproduce every behavior of Flower's
+built-in ``FedAvg``.
+
+The guarantee it does provide is that one Flower client result becomes exactly
+one validated, complete Rust update -- one identity, one sample count, one
+aggregation decision, and one reputation update.
+
+Supported behavior
+------------------
+* Supported Flower range: ``>=1.5,<2``. CI tests both ends of that range
+  explicitly -- **1.5.0** (the declared floor) and **1.32.1** -- rather than
+  whichever version a resolver happens to pick. Versions between them are
+  within the promise but are not individually exercised.
+* ``accept_failures`` is honored: reported failures refuse the round unless it
+  is set.
+* FedAvg weights each update by the result's ``num_examples``.
+* Robust methods (median, trimmed mean, Krum, Multi-Krum) treat each accepted
+  client update as one participant. ``num_examples`` is *not* reinterpreted as
+  an algorithmic weight there -- an attacker claiming a large sample count
+  would otherwise gain proportional influence over a median.
+* A client's complete model is flattened and aggregated as one update, then
+  split back into the original layer shapes.
+* Arrays are aggregated at ``float32`` precision. ``float64`` input is accepted
+  and converted; its extra precision is not preserved.
+* A malformed model structure rejects the round rather than being dropped.
+* Reputation gating and updates are performed once, by the Rust aggregator.
+* Metrics are aggregated only through a caller-supplied
+  ``fit_metrics_aggregation_fn``.
 
 Usage::
 
@@ -13,15 +39,10 @@ Usage::
         trim_fraction=0.2,
         min_fit_clients=5,
     )
-
-    fl.server.start_server(
-        server_address="0.0.0.0:8080",
-        config=fl.server.ServerConfig(num_rounds=10),
-        strategy=strategy,
-    )
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -44,28 +65,46 @@ except ImportError:
     ) from None
 
 
-class QoraStrategy(FedAvg):
-    """Byzantine-tolerant federated learning strategy using Qora-FL.
+#: Methods that weight by sample count. Everything else treats one accepted
+#: client update as one participant; see the module docstring.
+_SAMPLE_WEIGHTED_METHODS = frozenset({"fedavg"})
 
-    Replaces FedAvg's naive averaging with robust aggregation to tolerate
-    up to 30% malicious clients. Tracks client reputations across rounds
-    and filters out low-reputation participants.
+
+@dataclass
+class _ClientResult:
+    """One Flower result, kept whole.
+
+    The fields travel together so that filtering or validation cannot leave
+    identities, updates, and sample counts misaligned -- the failure mode of
+    building parallel lists and indexing them separately.
+    """
+
+    client_id: str
+    layers: List[np.ndarray]
+    num_examples: int
+    metrics: Dict[str, Scalar]
+
+
+class QoraStrategy(FedAvg):
+    """Byzantine-tolerant Flower strategy backed by the Qora-FL Rust core.
 
     Parameters
     ----------
     aggregation_method : str
-        One of "trimmed_mean", "median", "fedavg", "krum", or "krum:N".
-        Default "trimmed_mean".
+        One of ``"trimmed_mean"``, ``"median"``, ``"fedavg"``, ``"krum"``,
+        ``"krum:f"``, ``"multi_krum"``, or ``"multi_krum:f:m"``.
+        Default ``"trimmed_mean"``.
     trim_fraction : float
-        Fraction to trim from each end (only for trimmed_mean). Default 0.2.
+        Fraction trimmed from each end (trimmed_mean only). Default 0.2.
     reputation_threshold : float
-        Clients below this score are excluded from aggregation. Default 0.2.
+        Clients below this score are excluded. Enforced by the Rust
+        aggregator, not here. Default 0.2.
     reputation_decay_rate : float
-        Per-round decay rate toward default (0.5). 0.0 disables decay.
-        Typical: 0.01-0.05. Default 0.0.
+        Per-round decay toward the 0.5 default. 0.0 disables. Default 0.0.
     **kwargs
-        Additional arguments passed to ``flwr.server.strategy.FedAvg``
-        (fraction_fit, min_fit_clients, initial_parameters, etc.)
+        Passed to ``flwr.server.strategy.FedAvg`` (``fraction_fit``,
+        ``min_fit_clients``, ``accept_failures``,
+        ``fit_metrics_aggregation_fn``, ...).
     """
 
     def __init__(
@@ -80,8 +119,11 @@ class QoraStrategy(FedAvg):
         self.aggregator = ByzantineAggregator(
             aggregation_method, trim_fraction, ban_threshold=reputation_threshold
         )
+        self.aggregation_method = aggregation_method
         self.reputation_threshold = reputation_threshold
         self.reputation_decay_rate = reputation_decay_rate
+
+    # -- Round entry point -------------------------------------------------
 
     def aggregate_fit(
         self,
@@ -89,73 +131,216 @@ class QoraStrategy(FedAvg):
         results: List[Tuple[ClientProxy, FitRes]],
         failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
-        """Aggregate model updates using Byzantine-tolerant aggregation.
+        """Aggregate one round of client updates.
 
-        Overrides FedAvg.aggregate_fit to route updates through the Rust-backed
-        Qora-FL aggregator with reputation-based client filtering.
+        Refuses the round -- returning ``(None, {})`` without invoking Rust or
+        touching reputation -- when there are no results, or when failures were
+        reported and ``accept_failures`` is False.
+
+        Raises
+        ------
+        ValueError
+            If a successful result is malformed. Malformed results are not
+            silently discarded: dropping them would change the effective
+            adversarial fraction of the round, which is exactly the quantity
+            Krum's ``n >= 2f + 3`` condition is stated over.
         """
         if not results:
             return None, {}
 
-        # Extract client data
-        client_ids = []
-        all_ndarrays = []
-        for client_proxy, fit_res in results:
-            client_ids.append(client_proxy.cid)
-            all_ndarrays.append(parameters_to_ndarrays(fit_res.parameters))
+        # Failures are refused before anything else so that a refused round
+        # cannot aggregate, move reputation, or invoke the metrics callback.
+        if failures and not self.accept_failures:
+            return None, {}
 
-        # Filter clients below reputation threshold
-        filtered = [
-            i
-            for i, cid in enumerate(client_ids)
-            if self.aggregator.get_reputation(cid) >= self.reputation_threshold
+        records = [
+            self._to_record(client_proxy, fit_res) for client_proxy, fit_res in results
         ]
 
-        # Fall back to all clients if filtering removes everyone
-        if not filtered:
-            filtered = list(range(len(client_ids)))
+        shapes = self._validate_structure(records)
+        flat_updates = [self._flatten(record, shapes) for record in records]
+        client_ids = [record.client_id for record in records]
+        weights = self._sample_weights(records)
 
-        # Aggregate layer-by-layer
-        n_layers = len(all_ndarrays[0])
-        aggregated_layers = []
+        # One call, one gating decision, one reputation update per client.
+        aggregated_flat = self.aggregator.aggregate(flat_updates, client_ids, weights)
 
-        for layer_idx in range(n_layers):
-            layer_updates = []
-            layer_cids = []
-            for i in filtered:
-                arr = all_ndarrays[i][layer_idx]
-                original_shape = arr.shape
-                # Flatten to (1, N) for the Rust aggregator
-                arr_2d = arr.reshape(1, -1).astype(np.float32)
-                layer_updates.append(arr_2d)
-                layer_cids.append(client_ids[i])
-
-            # Pass client_ids only on the first layer to avoid
-            # redundant reputation updates per layer
-            cids = layer_cids if layer_idx == 0 else None
-            aggregated_2d = self.aggregator.aggregate(layer_updates, cids)
-            aggregated_layers.append(aggregated_2d.reshape(original_shape))
-
+        aggregated_layers = self._restore(aggregated_flat, shapes)
         parameters_aggregated = ndarrays_to_parameters(aggregated_layers)
 
-        # Build metrics
-        metrics: Dict[str, Scalar] = {
-            "qora_round": server_round,
-            "qora_num_clients": len(filtered),
-            "qora_num_filtered": len(results) - len(filtered),
-        }
-        for cid in client_ids:
-            metrics[f"reputation_{cid}"] = self.aggregator.get_reputation(cid)
+        metrics = self._aggregate_metrics(records)
 
-        if self.fit_metrics_aggregation_fn:
-            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
-            metrics.update(self.fit_metrics_aggregation_fn(fit_metrics))
-
-        # Apply reputation decay at end of round (if configured)
         if self.reputation_decay_rate > 0:
             self.aggregator.decay_reputations(self.reputation_decay_rate)
 
         return parameters_aggregated, metrics
+
+    # -- Extraction and validation ----------------------------------------
+
+    @staticmethod
+    def _to_record(client_proxy: ClientProxy, fit_res: FitRes) -> _ClientResult:
+        """Build one complete record, validating the sample count."""
+        client_id = client_proxy.cid
+        num_examples = fit_res.num_examples
+
+        # bool is an int subclass but is never a meaningful sample count.
+        if isinstance(num_examples, bool) or not isinstance(num_examples, int):
+            raise ValueError(
+                f"client {client_id}: num_examples must be an integer, "
+                f"got {type(num_examples).__name__}"
+            )
+        if num_examples < 0:
+            raise ValueError(
+                f"client {client_id}: num_examples must not be negative, "
+                f"got {num_examples}"
+            )
+
+        return _ClientResult(
+            client_id=client_id,
+            layers=list(parameters_to_ndarrays(fit_res.parameters)),
+            num_examples=num_examples,
+            metrics=dict(fit_res.metrics or {}),
+        )
+
+    @staticmethod
+    def _validate_structure(
+        records: Sequence[_ClientResult],
+    ) -> List[Tuple[int, ...]]:
+        """Check every client against the first as structural reference.
+
+        Returns the reference layer shapes. Two models with the same total
+        element count but different layer structure are *not* compatible --
+        ``[(10, 4), (4,)]`` and ``[(44,)]`` both hold 44 values and mean
+        entirely different things -- so shapes are compared exactly rather than
+        relying on NumPy broadcasting to reconcile them.
+        """
+        reference = records[0]
+        if not reference.layers:
+            raise ValueError(f"client {reference.client_id}: model has no layers")
+
+        shapes = [np.shape(layer) for layer in reference.layers]
+
+        for record in records:
+            if len(record.layers) != len(shapes):
+                raise ValueError(
+                    f"client {record.client_id}: model has {len(record.layers)} "
+                    f"layers, expected {len(shapes)} "
+                    f"(reference client {reference.client_id})"
+                )
+
+            for index, (layer, expected) in enumerate(zip(record.layers, shapes)):
+                array = np.asarray(layer)
+
+                if array.shape != expected:
+                    raise ValueError(
+                        f"client {record.client_id}: layer {index} has shape "
+                        f"{array.shape}, expected {expected} "
+                        f"(reference client {reference.client_id})"
+                    )
+                if array.dtype.kind != "f":
+                    raise ValueError(
+                        f"client {record.client_id}: layer {index} has dtype "
+                        f"{array.dtype}, expected a floating-point dtype "
+                        f"(model parameters are aggregated as float32)"
+                    )
+                if not np.isfinite(array).all():
+                    raise ValueError(
+                        f"client {record.client_id}: layer {index} contains "
+                        f"non-finite values (NaN or infinity)"
+                    )
+
+        if sum(int(np.prod(shape)) for shape in shapes) == 0:
+            raise ValueError(
+                f"client {reference.client_id}: model contains no parameters"
+            )
+
+        return shapes
+
+    # -- Flatten / restore -------------------------------------------------
+
+    @staticmethod
+    def _flatten(
+        record: _ClientResult, shapes: Sequence[Tuple[int, ...]]
+    ) -> np.ndarray:
+        """Concatenate a client's whole model into one ``(1, P)`` row.
+
+        Aggregating layer by layer would let a selection method choose a
+        different client for each layer, producing a model no client actually
+        submitted. Flattening first makes Krum select one coherent full-model
+        update, Multi-Krum select one coherent cohort, and the reputation
+        distance reflect every layer.
+        """
+        del shapes  # structure already validated; kept for call-site symmetry
+        flat = np.concatenate(
+            [
+                np.ascontiguousarray(layer, dtype=np.float32).reshape(-1)
+                for layer in record.layers
+            ]
+        )
+        return flat.reshape(1, -1)
+
+    @staticmethod
+    def _restore(
+        aggregated: np.ndarray, shapes: Sequence[Tuple[int, ...]]
+    ) -> List[np.ndarray]:
+        """Split one aggregated row back into the original layer structure."""
+        flat = np.asarray(aggregated, dtype=np.float32).reshape(-1)
+        sizes = [int(np.prod(shape)) for shape in shapes]
+        expected = sum(sizes)
+
+        if flat.size != expected:
+            raise ValueError(
+                f"aggregated update has {flat.size} values, expected {expected}"
+            )
+
+        layers: List[np.ndarray] = []
+        offset = 0
+        for shape, size in zip(shapes, sizes):
+            # copy(): each layer owns its buffer rather than viewing into the
+            # shared aggregate, so a caller mutating one cannot affect another.
+            layers.append(flat[offset : offset + size].reshape(shape).copy())
+            offset += size
+
+        return layers
+
+    # -- Weighting and metrics --------------------------------------------
+
+    def _sample_weights(
+        self, records: Sequence[_ClientResult]
+    ) -> Optional[List[float]]:
+        """Sample-count weights, for FedAvg only.
+
+        Returns None for the robust methods so that ``num_examples`` is never
+        quietly reinterpreted as an algorithmic weight; see the module
+        docstring for why that would weaken their guarantee.
+        """
+        method = self.aggregation_method.strip().split(":", 1)[0]
+        if method not in _SAMPLE_WEIGHTED_METHODS:
+            return None
+
+        weights = [float(record.num_examples) for record in records]
+        if sum(weights) <= 0.0:
+            raise ValueError(
+                "FedAvg requires a positive total sample count, but every "
+                "accepted client reported num_examples=0"
+            )
+        return weights
+
+    def _aggregate_metrics(self, records: Sequence[_ClientResult]) -> Dict[str, Scalar]:
+        """Delegate metrics to the caller's aggregation function.
+
+        Returns ``{}`` when none is configured. Metric names carry
+        application-specific meaning -- ``loss`` and ``accuracy`` do not
+        combine the same way -- so the adapter does not invent an aggregation
+        policy of its own.
+        """
+        if not self.fit_metrics_aggregation_fn:
+            return {}
+
+        pairs = [(record.num_examples, record.metrics) for record in records]
+        return dict(self.fit_metrics_aggregation_fn(pairs))
+
+    # -- Reputation --------------------------------------------------------
 
     def get_reputation(self, client_id: str) -> float:
         """Get the reputation score for a specific client."""

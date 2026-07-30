@@ -17,7 +17,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-flower = ["flwr>=1.5.0"]
+# Flower is optional: the core bindings are useful without it, and importing
+# `qora` succeeds when it is absent. Only `qora.QoraStrategy` requires it, and
+# raises an install hint if it is missing.
+#
+# Upper-bounded because the adapter targets Flower's 1.x strategy interface;
+# an unbounded requirement would let a 2.x release break installs silently.
+#
+# Supported: >=1.5,<2. Tested in CI: 1.5.0 and 1.32.1 (both ends pinned in the
+# workflow matrix). Versions in between are covered by the promise but are not
+# individually exercised.
+flower = ["flwr>=1.5,<2"]
 
 [project.urls]
 Homepage = "https://github.com/CavinKrenik/qora-fl"

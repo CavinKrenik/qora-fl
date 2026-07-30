@@ -238,6 +238,45 @@ impl ByzantineAggregator {
         updates: &[Array2<f32>],
         client_ids: Option<&[String]>,
     ) -> Result<Array2<f32>, QoraError> {
+        self.aggregate_weighted(updates, client_ids, None)
+    }
+
+    /// Aggregate with per-client weights.
+    ///
+    /// Identical to [`Self::aggregate`] except that `weights` (typically each
+    /// client's sample count) participate in the mean.
+    ///
+    /// Weights apply to [`AggregationMethod::FedAvg`] only. The robust methods
+    /// operate on client updates rather than per-sample votes, so reweighting
+    /// them would change their Byzantine guarantee -- an attacker who claims a
+    /// large sample count would gain proportional influence over a median or
+    /// trimmed mean. Supplying weights for any other method is therefore an
+    /// error rather than a silent no-op.
+    ///
+    /// Weights are filtered alongside updates when reputation gating removes a
+    /// client, so the correspondence is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::aggregate`] can return, plus:
+    ///
+    /// * [`QoraError::WeightsNotSupported`] if weights accompany a method
+    ///   other than FedAvg.
+    /// * [`QoraError::NonFiniteWeight`] if any weight is NaN or infinite.
+    /// * [`QoraError::DimensionMismatch`] if the weight count differs from the
+    ///   update count.
+    pub fn aggregate_weighted(
+        &mut self,
+        updates: &[Array2<f32>],
+        client_ids: Option<&[String]>,
+        weights: Option<&[f32]>,
+    ) -> Result<Array2<f32>, QoraError> {
+        if weights.is_some() && !matches!(self.method, AggregationMethod::FedAvg) {
+            return Err(QoraError::WeightsNotSupported {
+                method: format!("{:?}", self.method),
+            });
+        }
+
         // Validate before anything else. Two reasons this must come first:
         // the ban filter below indexes `updates` with positions derived from
         // `client_ids` (a length mismatch would panic), and non-finite values
@@ -246,40 +285,58 @@ impl ByzantineAggregator {
         // otherwise be both unpenalized and unbannable.
         validate_updates(updates)?;
         validate_client_ids(updates, client_ids)?;
+        if let Some(w) = weights {
+            if w.len() != updates.len() {
+                return Err(QoraError::DimensionMismatch);
+            }
+            crate::validation::validate_weights(w)?;
+        }
 
         // Filter banned clients if reputation gating is enabled
-        let (filtered_updates, filtered_ids): (Vec<Array2<f32>>, Option<Vec<String>>) =
-            if self.ban_threshold > 0.0 {
-                if let Some(ids) = client_ids {
-                    let active: Vec<usize> = ids
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, id)| self.get_reputation(id) >= self.ban_threshold)
-                        .map(|(i, _)| i)
-                        .collect();
+        #[allow(clippy::type_complexity)]
+        let (filtered_updates, filtered_ids, filtered_weights): (
+            Vec<Array2<f32>>,
+            Option<Vec<String>>,
+            Option<Vec<f32>>,
+        ) = if self.ban_threshold > 0.0 {
+            if let Some(ids) = client_ids {
+                let active: Vec<usize> = ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, id)| self.get_reputation(id) >= self.ban_threshold)
+                    .map(|(i, _)| i)
+                    .collect();
 
-                    // Fail closed. Reinstating the rejected clients here would
-                    // defeat the gate exactly when reputation distrusts the
-                    // whole cohort -- the one round where the policy matters
-                    // most. Returning before any aggregation also means no
-                    // score moves on this path.
-                    if active.is_empty() {
-                        return Err(QoraError::AllUpdatesRejected {
-                            total: updates.len(),
-                            rejected: ids.len() - active.len(),
-                            threshold: self.ban_threshold,
-                        });
-                    }
-
-                    let u: Vec<Array2<f32>> = active.iter().map(|&i| updates[i].clone()).collect();
-                    let new_ids: Vec<String> = active.iter().map(|&i| ids[i].clone()).collect();
-                    (u, Some(new_ids))
-                } else {
-                    (updates.to_vec(), None)
+                // Fail closed. Reinstating the rejected clients here would
+                // defeat the gate exactly when reputation distrusts the
+                // whole cohort -- the one round where the policy matters
+                // most. Returning before any aggregation also means no
+                // score moves on this path.
+                if active.is_empty() {
+                    return Err(QoraError::AllUpdatesRejected {
+                        total: updates.len(),
+                        rejected: ids.len() - active.len(),
+                        threshold: self.ban_threshold,
+                    });
                 }
+
+                let u: Vec<Array2<f32>> = active.iter().map(|&i| updates[i].clone()).collect();
+                let new_ids: Vec<String> = active.iter().map(|&i| ids[i].clone()).collect();
+                // Weights are indexed by the same positions, so they must
+                // be filtered with the same selection or they would be
+                // applied to the wrong clients.
+                let w = weights.map(|w| active.iter().map(|&i| w[i]).collect());
+                (u, Some(new_ids), w)
             } else {
-                (updates.to_vec(), client_ids.map(|ids| ids.to_vec()))
-            };
+                (updates.to_vec(), None, weights.map(|w| w.to_vec()))
+            }
+        } else {
+            (
+                updates.to_vec(),
+                client_ids.map(|ids| ids.to_vec()),
+                weights.map(|w| w.to_vec()),
+            )
+        };
 
         let agg_updates = &filtered_updates;
 
@@ -298,7 +355,7 @@ impl ByzantineAggregator {
                 trimmed_mean(agg_updates, frac)?
             }
             AggregationMethod::Median => median(agg_updates)?,
-            AggregationMethod::FedAvg => fedavg(agg_updates, None)?,
+            AggregationMethod::FedAvg => fedavg(agg_updates, filtered_weights.as_deref())?,
             AggregationMethod::Krum(f) => {
                 let bfp_vecs: Vec<krum::Bfp16Vec> = agg_updates
                     .iter()
@@ -574,6 +631,98 @@ mod tests {
         assert_eq!(
             r1, r2,
             "Krum through ByzantineAggregator must be deterministic"
+        );
+    }
+
+    #[test]
+    fn test_weighted_fedavg_honors_weights() {
+        let mut agg = ByzantineAggregator::new(AggregationMethod::FedAvg, 0.0);
+        let updates = vec![array![[0.0]], array![[10.0]]];
+
+        // Equal weighting would give 5.0.
+        let result = agg
+            .aggregate_weighted(&updates, None, Some(&[1.0, 9.0]))
+            .unwrap();
+        assert!(
+            (result[[0, 0]] - 9.0).abs() < 1e-5,
+            "got {}",
+            result[[0, 0]]
+        );
+    }
+
+    #[test]
+    fn test_weights_are_refused_for_robust_methods() {
+        // Reweighting a median by claimed sample count would let an attacker
+        // buy influence with a number they control, so it is an error rather
+        // than a silent no-op.
+        for method in [
+            AggregationMethod::Median,
+            AggregationMethod::TrimmedMean,
+            AggregationMethod::Krum(1),
+            AggregationMethod::MultiKrum(1, None),
+        ] {
+            let mut agg = ByzantineAggregator::new(method.clone(), 0.2);
+            let updates = vec![array![[1.0]], array![[2.0]]];
+            assert!(
+                matches!(
+                    agg.aggregate_weighted(&updates, None, Some(&[1.0, 2.0])),
+                    Err(QoraError::WeightsNotSupported { .. })
+                ),
+                "{:?} must refuse weights",
+                method
+            );
+        }
+    }
+
+    #[test]
+    fn test_weight_count_must_match_updates() {
+        let mut agg = ByzantineAggregator::new(AggregationMethod::FedAvg, 0.0);
+        let updates = vec![array![[1.0]], array![[2.0]]];
+        assert!(matches!(
+            agg.aggregate_weighted(&updates, None, Some(&[1.0])),
+            Err(QoraError::DimensionMismatch)
+        ));
+    }
+
+    #[test]
+    fn test_non_finite_weights_are_rejected() {
+        let mut agg = ByzantineAggregator::new(AggregationMethod::FedAvg, 0.0);
+        let updates = vec![array![[1.0]], array![[2.0]]];
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                matches!(
+                    agg.aggregate_weighted(&updates, None, Some(&[1.0, bad])),
+                    Err(QoraError::NonFiniteWeight { index: 1, .. })
+                ),
+                "weight {} must be rejected",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn test_weights_follow_clients_through_reputation_gating() {
+        // "banned" is filtered out; its weight must go with it rather than
+        // being applied to whichever client takes its position.
+        let json = r#"{"method":"FedAvg","trim_fraction":0.0,"reputation":{"banned":0.0,"good1":0.9,"good2":0.9},"ban_threshold":0.5,"adaptive_trim":false}"#;
+        let mut agg: ByzantineAggregator = serde_json::from_str(json).unwrap();
+
+        let updates = vec![array![[1000.0]], array![[0.0]], array![[10.0]]];
+        let ids = vec![
+            "banned".to_string(),
+            "good1".to_string(),
+            "good2".to_string(),
+        ];
+
+        let result = agg
+            .aggregate_weighted(&updates, Some(&ids), Some(&[999.0, 1.0, 9.0]))
+            .unwrap();
+
+        // Only good1 (0.0, weight 1) and good2 (10.0, weight 9) survive: 9.0.
+        assert!(
+            (result[[0, 0]] - 9.0).abs() < 1e-4,
+            "got {}",
+            result[[0, 0]]
         );
     }
 

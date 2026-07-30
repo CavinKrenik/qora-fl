@@ -88,6 +88,30 @@ pub enum QoraError {
         maximum: usize,
     },
 
+    /// Reputation gating rejected every submitted client
+    ///
+    /// Raised instead of silently restoring the rejected updates. Earlier
+    /// versions failed open here: when no client cleared the threshold the
+    /// filter was bypassed and every banned client was reinstated, which
+    /// defeated the gate precisely when the reputation system distrusted the
+    /// entire cohort.
+    ///
+    /// Distinct from [`QoraError::EmptyUpdates`] (updates *were* supplied) and
+    /// from [`QoraError::InsufficientQuorum`] (the cause is policy, not
+    /// cohort size).
+    #[error(
+        "reputation gating rejected all updates: {rejected} of {total} \
+         below threshold {threshold}"
+    )]
+    AllUpdatesRejected {
+        /// Number of updates submitted for the round
+        total: usize,
+        /// Number rejected by the gate (equal to `total` when this is raised)
+        rejected: usize,
+        /// The configured ban threshold that rejected them
+        threshold: f32,
+    },
+
     /// Error in reputation tracking
     #[error("Reputation error: {0}")]
     ReputationError(String),

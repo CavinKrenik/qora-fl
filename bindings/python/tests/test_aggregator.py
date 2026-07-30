@@ -218,6 +218,67 @@ class TestMultiKrumSelectionBound:
             agg.aggregate(_spread(4))
 
 
+# --- Reputation gating fails closed ---
+
+
+class TestReputationGatingFailsClosed:
+    """A client rejected by the reputation gate is never silently restored.
+
+    Unknown clients start at 0.5, so a threshold above that rejects the whole
+    cohort -- which now raises instead of quietly aggregating everyone.
+    """
+
+    def test_all_banned_clients_raise(self):
+        agg = ByzantineAggregator("fedavg", 0.0, ban_threshold=0.99)
+        updates = [np.array([[float(i)]], dtype=np.float32) for i in range(1, 4)]
+
+        with pytest.raises(ValueError, match="reputation gating rejected all updates"):
+            agg.aggregate(updates, ["a", "b", "c"])
+
+    def test_error_names_counts_and_threshold(self):
+        agg = ByzantineAggregator("fedavg", 0.0, ban_threshold=0.99)
+        updates = [np.array([[float(i)]], dtype=np.float32) for i in range(1, 4)]
+
+        with pytest.raises(ValueError) as excinfo:
+            agg.aggregate(updates, ["a", "b", "c"])
+
+        message = str(excinfo.value)
+        assert "3 of 3" in message
+        assert "0.99" in message
+
+    def test_without_client_ids_gating_does_not_apply(self):
+        agg = ByzantineAggregator("fedavg", 0.0, ban_threshold=0.99)
+        updates = [
+            np.array([[1.0]], dtype=np.float32),
+            np.array([[3.0]], dtype=np.float32),
+        ]
+        # No IDs, so no update can be associated with a reputation entry.
+        result = agg.aggregate(updates)
+        assert abs(result[0, 0] - 2.0) < 1e-6
+
+    def test_default_threshold_leaves_aggregation_ungated(self):
+        # ban_threshold defaults to 0.0, so existing callers are unaffected.
+        agg = ByzantineAggregator("fedavg", 0.0)
+        updates = [
+            np.array([[1.0]], dtype=np.float32),
+            np.array([[3.0]], dtype=np.float32),
+        ]
+        result = agg.aggregate(updates, ["a", "b"])
+        assert abs(result[0, 0] - 2.0) < 1e-6
+
+    def test_malformed_input_still_outranks_gating(self):
+        # Every client would be banned here too; the NaN must still win.
+        agg = ByzantineAggregator("median", 0.0, ban_threshold=0.99)
+        updates = [
+            np.array([[1.0]], dtype=np.float32),
+            np.array([[np.nan]], dtype=np.float32),
+            np.array([[3.0]], dtype=np.float32),
+        ]
+
+        with pytest.raises(ValueError, match="[Nn]on-finite"):
+            agg.aggregate(updates, ["a", "b", "c"])
+
+
 # --- ReputationManager ---
 
 

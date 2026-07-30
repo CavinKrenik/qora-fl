@@ -841,20 +841,29 @@ fn test_ban_gating_excludes_bad_clients() {
 }
 
 #[test]
-fn test_ban_gating_fail_open() {
-    // If ALL clients would be banned, should use all (fail-open)
+/// Inverted from `test_ban_gating_fail_open`, which pinned the old behavior:
+/// when every client was banned the filter was bypassed and all of them were
+/// reinstated, so the gate did nothing precisely when reputation distrusted
+/// the entire cohort. Gating now fails closed.
+fn test_ban_gating_fails_closed_when_all_banned() {
     let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::FedAvg, 0.0, 0.99);
 
-    // No one has reputation >= 0.99, so ban gating would exclude everyone
+    // Unknown clients default to 0.5, so nobody clears a 0.99 threshold.
     let updates = vec![array![[1.0]], array![[2.0]], array![[3.0]]];
     let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
 
-    let result = agg.aggregate(&updates, Some(&ids)).unwrap();
-    // Fail-open: all clients used
-    assert!(
-        (result[[0, 0]] - 2.0).abs() < 1e-6,
-        "Fail-open should use all clients"
-    );
+    match agg.aggregate(&updates, Some(&ids)) {
+        Err(QoraError::AllUpdatesRejected {
+            total,
+            rejected,
+            threshold,
+        }) => {
+            assert_eq!(total, 3);
+            assert_eq!(rejected, 3);
+            assert!((threshold - 0.99).abs() < 1e-6);
+        }
+        other => panic!("expected AllUpdatesRejected, got {:?}", other),
+    }
 }
 
 #[test]

@@ -1,7 +1,9 @@
 //! Coordinate-wise trimmed mean aggregation
 //!
-//! Achieves Byzantine tolerance by trimming outliers per parameter coordinate.
-//! Validated to handle 30% Byzantine attackers in QRES experiments.
+//! Trims outliers per parameter coordinate. Robustness depends on the trim
+//! fraction, the adversarial proportion, the attack model, and the
+//! distribution of honest updates; a trim fraction is not an attacker
+//! percentage.
 
 use ndarray::Array2;
 use rayon::prelude::*;
@@ -14,11 +16,13 @@ use crate::validation::validate_updates;
 /// For each parameter coordinate, sorts values across all client updates,
 /// trims the top and bottom `trim_fraction` values, then averages the rest.
 ///
-/// # Byzantine Tolerance
+/// # Assumptions
 ///
-/// Can handle up to 30% Byzantine clients (validated in QRES).
-/// Each coordinate independently trims outliers, so attackers cannot
-/// corrupt the aggregate by poisoning individual parameters.
+/// Each coordinate independently sorts and trims, so robustness is a
+/// per-coordinate property. How much adversarial influence survives depends on
+/// `trim_fraction`, the adversarial proportion, and the attack model --
+/// `trim_fraction` is a trimming parameter, not a tolerated attacker
+/// percentage, and no universal tolerance is claimed here.
 ///
 /// # Arguments
 ///

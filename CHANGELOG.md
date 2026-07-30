@@ -15,6 +15,48 @@ prompting a review. Version metadata in `Cargo.toml` and
 release is actually cut; the API migrations recorded below take effect in
 0.4.0.
 
+### Documentation
+
+No behavior changed in this set; every item aligns a public claim with evidence
+that exists in this repository.
+
+- Clarified the assumptions and enforced preconditions for trimmed mean,
+  median, Krum, and Multi-Krum. A trim fraction is no longer presented as an
+  attacker percentage, and median is stated as requiring *strictly fewer than*
+  50% adversarial values per coordinate rather than tolerating 50%.
+- Narrowed determinism claims to integer Krum scoring after BFP-16 encoding.
+  The previous "deterministic aggregation paths" and "bit-perfect agreement"
+  wording covered a pipeline that begins with floating-point encoding and ends
+  with `f32` results.
+- Documented the Flower adapter's sample weighting, model validation, failure
+  policy, metrics behavior, and optional-dependency status, including the
+  supported and CI-tested Flower versions.
+- Clarified that reputation currently provides tracking and participation
+  gating. Cubic influence weighting exists as a utility and is not consumed by
+  any aggregation path; it is listed as roadmap work rather than a feature.
+- Reframed QRES as project history rather than validation evidence. The
+  181-day deployment, ESP32 hardware, and "Slander-Amplification" references
+  no longer appear as support for claims about Qora-FL, whose evidence is its
+  own tests and experiments.
+- Corrected the QRES repository link, which pointed at a 404
+  (`CavinKrenik/RaaS` → `CavinKrenik/QRES_RaaS`).
+- Added explicit experimental status, a "currently implemented" versus
+  "experimental or planned" split, and a validation-status section noting the
+  absence of an independent security review.
+- Rewrote `SECURITY.md` to separate what the project enforces from what it does
+  not provide, and to replace the single project-wide "30% Byzantine" threat
+  model with per-method assumptions.
+- Removed the published benchmark figures and their directional conclusions.
+  The evaluation script and its full configuration remain documented, along
+  with the two properties that stop a run from being reproducible evidence: the
+  dataset can be substituted silently when the OpenML fetch fails, and each
+  configuration runs once, giving no variance estimate. Publishing results again
+  requires a pinned dataset, multiple seeds, and saved machine-readable output.
+- Documented `verification::norm_bound` and `verification::audit` as
+  unintegrated and experimental.
+- Fixed a non-working Rust example in the README: `trim_fraction = 0.3` with
+  four clients trims every value and returns `InsufficientQuorum`.
+
 ### Fixed
 
 - **The Flower adapter aggregated and updated reputation per layer instead of

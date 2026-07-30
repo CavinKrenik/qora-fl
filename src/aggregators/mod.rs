@@ -3,10 +3,10 @@
 //! Provides multiple aggregation strategies with varying levels of
 //! Byzantine tolerance:
 //!
-//! | Method | Byzantine Tolerance | Speed |
+//! | Method | Assumption for robustness | Speed |
 //! |--------|-------------------|-------|
-//! | [`trimmed_mean`] | ~30% | Fast (parallel) |
-//! | [`median`] | ~50% | Fast (parallel) |
+//! | [`trimmed_mean`] | depends on trim fraction and attack model | Fast (parallel) |
+//! | [`median`] | strictly <50% adversarial per coordinate | Fast (parallel) |
 //! | [`krum`] | n >= 2f+3 | O(n^2) |
 //! | Multi-Krum | n >= 2f+3, 1 <= m <= n-2f-2 | O(n^2) |
 //! | [`fedavg`] | None (baseline) | Fastest |
@@ -73,7 +73,8 @@ where
 /// Aggregation method selection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AggregationMethod {
-    /// Coordinate-wise trimmed mean (default, ~30% Byzantine tolerance)
+    /// Coordinate-wise trimmed mean (default). Robustness depends on the trim
+    /// fraction and attack model; see [`trimmed_mean`].
     TrimmedMean,
     /// Coordinate-wise median (~50% Byzantine tolerance)
     Median,
@@ -151,7 +152,8 @@ impl ByzantineAggregator {
     /// # Arguments
     ///
     /// * `method` - Which aggregation algorithm to use
-    /// * `trim_fraction` - Fraction to trim from each end (0.0..0.5, typically 0.2 for 30% tolerance).
+    /// * `trim_fraction` - Fraction trimmed from each end (0.0..=0.5). This is
+    ///   a trimming parameter, not a tolerated attacker percentage.
     ///   Only used by [`AggregationMethod::TrimmedMean`].
     pub fn new(method: AggregationMethod, trim_fraction: f32) -> Self {
         Self {

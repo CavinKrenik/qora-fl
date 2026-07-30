@@ -11,7 +11,7 @@ pub mod krum_condition;
 pub mod norm_bound;
 
 pub use audit::{AggregationAuditEntry, AuditLog};
-pub use krum_condition::{krum_condition_met, krum_min_clients, max_tolerable_f};
+pub use krum_condition::{krum_condition_met, krum_min_clients, max_multi_krum_m, max_tolerable_f};
 pub use norm_bound::check_norm_bound;
 
 // The re-export itself trips the lint; the attribute is scoped to this single

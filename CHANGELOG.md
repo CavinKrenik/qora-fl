@@ -10,6 +10,16 @@ contradicted it.
 
 ### Fixed
 
+- **Multi-Krum now enforces its documented selection bound
+  `1 <= m <= n - 2f - 2`** (Blanchard et al., 2017). `aggregate_multi_krum_bfp16`
+  previously clamped with `m.max(1).min(n)`, so an oversized `m` returned a
+  normal-looking selection that carried no Byzantine guarantee -- the same
+  failure mode as the single-Krum "best-effort" path removed earlier in this
+  cycle. The low-level function now returns `None`; `ByzantineAggregator`
+  reports the new `QoraError::InvalidMultiKrumSelection`.
+
+  This matters most after reputation gating, where the effective `n` shrinks
+  between rounds and a fixed `m` can silently drift out of range.
 - Norm-bound verification now computes L2 norms with `f64` accumulation,
   preventing finite large updates from overflowing to infinity and very small
   updates from underflowing to zero.
@@ -95,6 +105,31 @@ contradicted it.
 - In `trimmed_mean`, update validation now runs before the `trim_fraction`
   range check. A call with both a dimension mismatch and an out-of-range
   fraction now reports `DimensionMismatch` rather than `InvalidTrimFraction`.
+- **`AggregationMethod::MultiKrum(usize, usize)` is now
+  `MultiKrum(usize, Option<usize>)`.** The `Option` lets the aggregation
+  boundary distinguish an omitted `m` from an explicitly requested one:
+  `None` caps to `min(3, n - 2f - 2)`, while `Some(m)` is honored exactly or
+  refused. Without the distinction, a bare `"multi_krum"` could not both
+  preserve the historical `m = 3` for large cohorts and stay inside the bound
+  for 5- and 6-client rounds.
+
+  **Migration.** `Option<usize>` serializes untagged, so the JSON is
+  compatible in both directions: a 0.3.1 payload `{"MultiKrum":[1,3]}` still
+  deserializes under 0.4.0, as `MultiKrum(1, Some(3))`, and `Some(3)` still
+  serializes to `[1,3]`. The omitted form is the new `{"MultiKrum":[1,null]}`.
+
+  What changes is *meaning*, not shape. A persisted 0.3.1 configuration
+  restores as an **explicit** `m`, so a round where `m > n - 2f - 2` now fails
+  with `InvalidMultiKrumSelection` instead of silently clamping. That is the
+  intended effect of the fix, but it can surface at restore time rather than at
+  upgrade time. Operators restoring 0.3.1 state should either confirm the
+  stored `m` fits their smallest expected cohort, or rewrite the second element
+  to `null` to adopt the adaptive default. Rust callers constructing the enum
+  directly must update `MultiKrum(f, m)` to `MultiKrum(f, Some(m))`.
+- Python `"multi_krum"` (no parameters) now selects `min(3, n - 2f - 2)`
+  vectors instead of a fixed 3, so 5- and 6-client rounds are safe rather than
+  silently outside the guarantee. Explicit `"multi_krum:f:m"` is unchanged
+  where valid and rejected where not; it is never silently rewritten.
 - `l2_norm` now uses an internal `f64` accumulator before returning `f32`,
   improving accuracy at extreme finite magnitudes.
 - `l2_norm_sq` is documented as able to overflow to infinity or underflow to
@@ -112,6 +147,15 @@ contradicted it.
   too and `aggregators` already depends on `verification`.
 - `verification::krum_min_clients(f)` -- minimum client count for a given `f`,
   with saturating arithmetic. Re-exported from `verification`.
+- `verification::max_multi_krum_m(n, f)` -- largest `m` Multi-Krum may select
+  for a given `(n, f)`, or 0 when the quorum condition fails. Re-exported from
+  `verification`.
+- `QoraError::InvalidMultiKrumSelection { clients, byzantine, selected,
+  maximum }` -- raised for an explicit `m` outside the safe range.
+- `tests/multi_krum_bounds.rs`: 13 integration tests covering the cap applied
+  to an omitted `m`, rejection of explicit out-of-range values, quorum
+  precedence, low-level `None` returns, and serde round-trips of both forms.
+  Six Python tests cover the same contract through the bindings.
 - `docs/SECURITY_NOTES.md` recording the measured pre-fix behavior behind each
   fix in this release.
 - 33 new tests, bringing the suite from 145 to 178:

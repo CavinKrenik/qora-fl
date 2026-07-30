@@ -1020,13 +1020,18 @@ fn test_krum_serde_roundtrip() {
 
 #[test]
 fn test_multi_krum_via_aggregator() {
-    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+    // n=7, f=1 -> max safe m = 7 - 2 - 2 = 3. This test previously ran with
+    // n=5, where m=3 exceeds the safe maximum of 1 and only "worked" because
+    // the old implementation clamped to n instead of enforcing the bound.
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, Some(3)), 0.0);
 
     let updates = vec![
         array![[1.0, 2.0]],
         array![[1.1, 2.1]],
         array![[0.9, 1.9]],
         array![[1.05, 2.05]],
+        array![[0.95, 1.95]],
+        array![[1.02, 2.02]],
         array![[50.0, 50.0]], // Byzantine
     ];
 
@@ -1046,23 +1051,49 @@ fn test_multi_krum_via_aggregator() {
 
 #[test]
 fn test_multi_krum_result_is_average() {
-    // Multi-Krum should return an average, not an exact input vector
-    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(0, 3), 0.0);
+    // Multi-Krum should return an average, not an exact input vector.
+    //
+    // Previously ran as MultiKrum(0, 3) over n=3, where the safe maximum is
+    // 3 - 0 - 2 = 1; selecting all three vectors was outside the guarantee.
+    // n=6, f=0 gives a safe maximum of 4, so m=3 is legitimate. Values are
+    // spaced non-uniformly so the average of the selected three is not itself
+    // one of the inputs -- with evenly spaced values it always is.
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(0, Some(3)), 0.0);
 
-    let updates = vec![array![[1.0]], array![[2.0]], array![[3.0]]];
+    let updates = vec![
+        array![[1.0]],
+        array![[2.0]],
+        array![[4.0]],
+        array![[8.0]],
+        array![[16.0]],
+        array![[100.0]],
+    ];
 
     let result = agg.aggregate(&updates, None).unwrap();
-    // All 3 selected, average = (1+2+3)/3 = 2.0
+
+    // The three lowest Krum scores are 8, 4, 2 -> average 14/3 ~= 4.667.
+    let expected = 14.0 / 3.0;
     assert!(
-        (result[[0, 0]] - 2.0).abs() < 0.01,
-        "Multi-Krum m=n should average all, got {}",
+        (result[[0, 0]] - expected).abs() < 0.05,
+        "expected the mean of the 3 selected vectors ({}), got {}",
+        expected,
         result[[0, 0]]
     );
+    for u in &updates {
+        assert!(
+            (result[[0, 0]] - u[[0, 0]]).abs() > 0.05,
+            "result {} should be an average, not the input {}",
+            result[[0, 0]],
+            u[[0, 0]]
+        );
+    }
 }
 
 #[test]
 fn test_multi_krum_too_few_clients() {
-    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+    // Quorum is checked before m, so this reports the shortfall in n rather
+    // than complaining about m -- the actionable finding for the caller.
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, Some(3)), 0.0);
 
     let updates = vec![array![[1.0]], array![[2.0]]];
     let result = agg.aggregate(&updates, None);
@@ -1071,7 +1102,8 @@ fn test_multi_krum_too_few_clients() {
 
 #[test]
 fn test_multi_krum_serde_roundtrip() {
-    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+    // Bare form (m omitted): n=5, f=1 caps m to min(3, 1) = 1.
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, None), 0.0);
 
     let updates = vec![
         array![[1.0]],
@@ -1094,14 +1126,17 @@ fn test_multi_krum_serde_roundtrip() {
 
 #[test]
 fn test_multi_krum_attack_resistance() {
-    // 4 honest + 1 Byzantine, Multi-Krum m=3 should pick 3 honest
-    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+    // 6 honest + 1 Byzantine. n=7, f=1 -> max safe m = 3. Previously n=5,
+    // where m=3 exceeded the safe maximum of 1.
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(1, Some(3)), 0.0);
 
     let updates = vec![
         array![[1.0, 1.0]],
         array![[1.1, 0.9]],
         array![[0.9, 1.1]],
         array![[1.05, 0.95]],
+        array![[0.95, 1.05]],
+        array![[1.02, 0.98]],
         array![[100.0, 100.0]], // Byzantine
     ];
     let ids = vec![
@@ -1109,6 +1144,8 @@ fn test_multi_krum_attack_resistance() {
         "b".to_string(),
         "c".to_string(),
         "d".to_string(),
+        "e".to_string(),
+        "g".to_string(),
         "attacker".to_string(),
     ];
 

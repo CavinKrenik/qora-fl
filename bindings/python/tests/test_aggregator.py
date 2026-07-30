@@ -156,6 +156,68 @@ class TestByzantineAggregator:
         np.testing.assert_allclose(result, np.ones((3, 4)), atol=1e-6)
 
 
+# --- Multi-Krum selection bound ---
+
+
+def _spread(n):
+    """Updates spaced so the mean of the selected set reveals how many were
+    selected."""
+    return [np.array([[1.0 + i * 1.7]], dtype=np.float32) for i in range(n)]
+
+
+class TestMultiKrumSelectionBound:
+    """Multi-Krum requires 1 <= m <= n - 2f - 2.
+
+    The bare ``"multi_krum"`` string omits m, so it is capped to
+    ``min(3, n - 2f - 2)``. An explicit ``"multi_krum:f:m"`` is honored exactly
+    or rejected -- never silently rewritten.
+    """
+
+    def test_bare_multi_krum_works_with_five_clients(self):
+        # f=1 defaults, so max safe m at n=5 is 1. Before enforcement this
+        # ran with m=3, outside the documented robustness condition.
+        agg = ByzantineAggregator("multi_krum", 0.0)
+        updates = _spread(5)
+        result = agg.aggregate(updates)
+
+        assert result.shape == (1, 1)
+        # m=1 means no averaging: the result is verbatim one of the inputs.
+        assert any(abs(result[0, 0] - u[0, 0]) < 1e-4 for u in updates)
+
+    def test_bare_multi_krum_averages_three_at_seven_clients(self):
+        agg = ByzantineAggregator("multi_krum", 0.0)
+        # Geometric spacing, not uniform: the mean of three evenly spaced
+        # values is the middle one, which would be indistinguishable from a
+        # single selection.
+        updates = [np.array([[2.0**i]], dtype=np.float32) for i in range(7)]
+        result = agg.aggregate(updates)
+
+        # Lowest three Krum scores are 4, 8, 16 -> mean 28/3.
+        assert abs(result[0, 0] - 28.0 / 3.0) < 0.05
+        # And therefore not any single input.
+        assert all(abs(result[0, 0] - u[0, 0]) > 1e-3 for u in updates)
+
+    def test_explicit_m_above_safe_maximum_is_rejected(self):
+        agg = ByzantineAggregator("multi_krum:1:3", 0.0)
+        with pytest.raises(ValueError, match="exceeds the safe maximum"):
+            agg.aggregate(_spread(5))
+
+    def test_explicit_m_within_bound_is_accepted(self):
+        agg = ByzantineAggregator("multi_krum:1:1", 0.0)
+        result = agg.aggregate(_spread(5))
+        assert result.shape == (1, 1)
+
+    def test_explicit_zero_m_is_rejected(self):
+        agg = ByzantineAggregator("multi_krum:1:0", 0.0)
+        with pytest.raises(ValueError):
+            agg.aggregate(_spread(7))
+
+    def test_below_quorum_reports_quorum_not_selection(self):
+        agg = ByzantineAggregator("multi_krum", 0.0)
+        with pytest.raises(ValueError, match="quorum"):
+            agg.aggregate(_spread(4))
+
+
 # --- ReputationManager ---
 
 

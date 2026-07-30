@@ -65,6 +65,29 @@ pub enum QoraError {
         client_ids: usize,
     },
 
+    /// An explicit Multi-Krum `m` falls outside the safe selection range
+    ///
+    /// Multi-Krum may average at most `n - 2f - 2` vectors (Blanchard et al.,
+    /// 2017); selecting more admits Byzantine vectors into the average and
+    /// voids the robustness guarantee. Raised only for an `m` the caller
+    /// supplied explicitly -- an omitted `m` is capped to the safe maximum
+    /// instead, since there is no caller intent to contradict.
+    #[error(
+        "Multi-Krum selection m={selected} exceeds the safe maximum {maximum} \
+         for {clients} clients with f={byzantine} (requires 1 <= m <= n - 2f - 2)"
+    )]
+    InvalidMultiKrumSelection {
+        /// Number of clients participating in the round (`n`)
+        clients: usize,
+        /// Maximum Byzantine clients the configuration expects (`f`)
+        byzantine: usize,
+        /// The `m` the caller asked for
+        selected: usize,
+        /// Largest `m` that preserves the guarantee (`n - 2f - 2`), or 0 if
+        /// the quorum condition `n >= 2f + 3` also fails
+        maximum: usize,
+    },
+
     /// Error in reputation tracking
     #[error("Reputation error: {0}")]
     ReputationError(String),

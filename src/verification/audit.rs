@@ -1,11 +1,24 @@
-//! Aggregation audit log for post-hoc analysis.
+//! Legacy aggregation audit log.
 //!
-//! Records metadata about each aggregation round, enabling
-//! reproducibility analysis and anomaly detection.
+//! **Superseded by [`crate::audit`]**, which carries a per-update disposition,
+//! typed rejection reasons, and full method parameters. The types here predate
+//! that schema, are not produced or consumed by anything, and are retained only
+//! because they were published in 0.3.1. Prefer
+//! [`crate::audit::AggregationAuditEntry`] -- note that it is a *different*
+//! type with the same name, reached through `crate::audit` rather than
+//! `crate::verification::audit`.
 
 use serde::{Deserialize, Serialize};
 
 /// Metadata for a single aggregation round.
+///
+/// Superseded by [`crate::AggregationAuditEntry`], which records a per-update
+/// disposition, typed rejection reasons, and full method parameters. The two
+/// are different types with the same name and **do not share a serialized
+/// shape**; records written with this type cannot be read as the new one.
+#[deprecated(
+    note = "use qora_fl::AggregationAuditEntry; the legacy verification audit schema will be removed in a future breaking release"
+)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AggregationAuditEntry {
     /// Round number (0-indexed).
@@ -21,11 +34,21 @@ pub struct AggregationAuditEntry {
 }
 
 /// Append-only audit log of aggregation rounds.
+///
+/// No replacement storage type is provided: persistence is now caller-owned.
+/// Serialize [`crate::AggregationAuditEntry`] and store the records with
+/// whatever the application already uses.
+#[deprecated(
+    note = "audit persistence is now caller-owned; serialize and store qora_fl::AggregationAuditEntry using application-defined storage"
+)]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+// The field type is itself deprecated; scoped to this definition only.
+#[allow(deprecated)]
 pub struct AuditLog {
     entries: Vec<AggregationAuditEntry>,
 }
 
+#[allow(deprecated)]
 impl AuditLog {
     /// Create a new, empty audit log.
     pub fn new() -> Self {
@@ -62,6 +85,7 @@ impl AuditLog {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // the deprecated types still ship, so keep testing them
 mod tests {
     use super::*;
 

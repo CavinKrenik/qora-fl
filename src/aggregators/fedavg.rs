@@ -6,8 +6,8 @@
 
 use ndarray::Array2;
 
-use super::validate::{validate_updates, validate_weights};
 use crate::error::QoraError;
+use crate::validation::{validate_updates, validate_weights};
 
 /// Standard FedAvg aggregation (no Byzantine defense).
 ///

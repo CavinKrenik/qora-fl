@@ -25,6 +25,12 @@ pub mod math;
 pub mod reputation;
 pub mod verification;
 
+// Cross-cutting input validation. Private: it is shared infrastructure for
+// `aggregators` and `verification`, not part of the public surface. Keeping it
+// at the crate root rather than under `aggregators` avoids a dependency cycle,
+// since `aggregators` already depends on `verification`.
+mod validation;
+
 // Re-exports
 pub use aggregators::aggregate_krum;
 pub use aggregators::aggregate_krum_bfp16;

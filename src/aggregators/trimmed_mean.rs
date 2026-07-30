@@ -6,8 +6,8 @@
 use ndarray::Array2;
 use rayon::prelude::*;
 
-use super::validate::validate_updates;
 use crate::error::QoraError;
+use crate::validation::validate_updates;
 
 /// Coordinate-wise trimmed mean aggregation.
 ///

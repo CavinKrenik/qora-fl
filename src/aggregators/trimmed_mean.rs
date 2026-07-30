@@ -6,6 +6,7 @@
 use ndarray::Array2;
 use rayon::prelude::*;
 
+use super::validate::validate_updates;
 use crate::error::QoraError;
 
 /// Coordinate-wise trimmed mean aggregation.
@@ -24,15 +25,20 @@ use crate::error::QoraError;
 /// * `updates` - Client model updates as 2D arrays (one per client)
 /// * `trim_fraction` - Fraction to trim from each end (0.0..0.5, typically 0.2)
 ///
+/// # Errors
+///
+/// Returns [`QoraError::NonFiniteValue`] if any update contains NaN or
+/// infinity. This is rejected rather than sanitized: NaN compares unordered,
+/// so its position after sorting -- and therefore whether it lands inside the
+/// trimmed window -- would depend on which client submitted it.
+///
 /// # Note
 ///
 /// Weights are intentionally not supported here because sorting destroys the
 /// correspondence between values and their original client weights. Use
 /// [`super::fedavg`] for weighted aggregation without Byzantine tolerance.
 pub fn trimmed_mean(updates: &[Array2<f32>], trim_fraction: f32) -> Result<Array2<f32>, QoraError> {
-    if updates.is_empty() {
-        return Err(QoraError::EmptyUpdates);
-    }
+    validate_updates(updates)?;
 
     if !(0.0..=0.5).contains(&trim_fraction) {
         return Err(QoraError::InvalidTrimFraction(trim_fraction));
@@ -40,12 +46,6 @@ pub fn trimmed_mean(updates: &[Array2<f32>], trim_fraction: f32) -> Result<Array
 
     let n_clients = updates.len();
     let dim = updates[0].dim();
-
-    for update in &updates[1..] {
-        if update.dim() != dim {
-            return Err(QoraError::DimensionMismatch);
-        }
-    }
 
     let n_trim = (n_clients as f32 * trim_fraction).ceil() as usize;
     let n_keep = n_clients.saturating_sub(2 * n_trim);
@@ -68,6 +68,8 @@ pub fn trimmed_mean(updates: &[Array2<f32>], trim_fraction: f32) -> Result<Array
 
             let mut values: Vec<f32> = updates.iter().map(|update| update[[row, col]]).collect();
 
+            // validate_updates guarantees all values are finite, so partial_cmp
+            // never returns None here; the fallback is defensive only.
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
             let trimmed = &values[n_trim..n_clients - n_trim];

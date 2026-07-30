@@ -201,7 +201,7 @@ let avg = fedavg(&updates, None).unwrap();
 | `TrimmedMean` | ~30% of clients | Default choice for most FL deployments |
 | `Median` | ~50% of clients | When stronger robustness is needed |
 | `Krum` | n >= 2f+3 | Deterministic single-vector selection |
-| `MultiKrum` | n >= 2f+3 | Top-m averaging for smoother convergence |
+| `MultiKrum` | n >= 2f+3, 1 <= m <= n-2f-2 | Top-m averaging for smoother convergence |
 | `FedAvg` | None | Baseline comparison only |
 
 ## Benchmarks

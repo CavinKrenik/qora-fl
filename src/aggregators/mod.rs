@@ -8,7 +8,7 @@
 //! | [`trimmed_mean`] | ~30% | Fast (parallel) |
 //! | [`median`] | ~50% | Fast (parallel) |
 //! | [`krum`] | n >= 2f+3 | O(n^2) |
-//! | Multi-Krum | n >= 2f+3, m <= n-2f-2 | O(n^2) |
+//! | Multi-Krum | n >= 2f+3, 1 <= m <= n-2f-2 | O(n^2) |
 //! | [`fedavg`] | None (baseline) | Fastest |
 
 pub mod adaptive;
@@ -31,7 +31,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::QoraError;
 use crate::reputation::ReputationStore;
 use crate::validation::{validate_client_ids, validate_updates};
-use crate::verification::krum_condition::krum_min_clients;
+use crate::verification::krum_condition::{krum_condition_met, krum_min_clients, max_multi_krum_m};
+
+/// Vectors Multi-Krum selects when `m` is omitted, before capping to the safe
+/// maximum. Chosen to preserve the historical default for cohorts large enough
+/// to support it.
+const DEFAULT_MULTI_KRUM_M: usize = 3;
 
 /// Aggregation method selection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -45,13 +50,24 @@ pub enum AggregationMethod {
     /// Krum selection via BFP-16 block floating-point (deterministic, n >= 2f+3)
     ///
     /// The inner value is `f`, the maximum number of Byzantine nodes expected.
-    /// Requires `n >= 2f + 3` clients for full guarantees (best-effort below).
+    /// Requires `n >= 2f + 3` clients; rounds below that are refused with
+    /// [`QoraError::InsufficientQuorum`] rather than aggregated.
     Krum(usize),
     /// Multi-Krum: select top-m vectors by Krum score and average them.
     ///
     /// `(f, m)` — `f` is the max Byzantine count, `m` is the number of vectors
-    /// to select and average. For full tolerance, `m <= n - 2f - 2`.
-    MultiKrum(usize, usize),
+    /// to select and average. Requires `n >= 2f + 3` and `1 <= m <= n - 2f - 2`.
+    ///
+    /// `m` is deliberately an `Option` so that the aggregation boundary can
+    /// tell an omitted `m` from an explicitly requested one:
+    ///
+    /// * `None` — cap to the safe maximum, `min(3, n - 2f - 2)`. There is no
+    ///   caller intent to contradict, so a small cohort silently selects fewer
+    ///   vectors instead of failing.
+    /// * `Some(m)` — honored exactly, or refused with
+    ///   [`QoraError::InvalidMultiKrumSelection`]. An explicit request is
+    ///   never silently rewritten.
+    MultiKrum(usize, Option<usize>),
 }
 
 /// High-level Byzantine-tolerant aggregator for federated learning.
@@ -231,6 +247,36 @@ impl ByzantineAggregator {
                 agg_updates[best_idx].clone()
             }
             AggregationMethod::MultiKrum(f, m) => {
+                let n = agg_updates.len();
+
+                // Quorum first: below it there is no safe m at all, and
+                // reporting a maximum of 0 would be less actionable than
+                // naming the real shortfall.
+                if !krum_condition_met(n, f) {
+                    return Err(QoraError::InsufficientQuorum {
+                        needed: krum_min_clients(f),
+                        actual: n,
+                    });
+                }
+
+                let max_m = max_multi_krum_m(n, f);
+                let m_eff = match m {
+                    // Omitted: cap to the safe maximum. Preserves the
+                    // historical m=3 wherever it is valid, and degrades to
+                    // fewer selections for small cohorts rather than failing.
+                    None => DEFAULT_MULTI_KRUM_M.min(max_m),
+                    // Explicit: honored or refused, never rewritten.
+                    Some(requested) if requested >= 1 && requested <= max_m => requested,
+                    Some(requested) => {
+                        return Err(QoraError::InvalidMultiKrumSelection {
+                            clients: n,
+                            byzantine: f,
+                            selected: requested,
+                            maximum: max_m,
+                        })
+                    }
+                };
+
                 let bfp_vecs: Vec<krum::Bfp16Vec> = agg_updates
                     .iter()
                     .map(|u| {
@@ -239,10 +285,10 @@ impl ByzantineAggregator {
                     })
                     .collect();
 
-                let indices = aggregate_multi_krum_bfp16(&bfp_vecs, f, m).ok_or(
+                let indices = aggregate_multi_krum_bfp16(&bfp_vecs, f, m_eff).ok_or(
                     QoraError::InsufficientQuorum {
                         needed: krum_min_clients(f),
-                        actual: agg_updates.len(),
+                        actual: n,
                     },
                 )?;
 

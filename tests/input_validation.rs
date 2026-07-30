@@ -164,7 +164,7 @@ fn aggregate_rejects_nan() {
         AggregationMethod::Median,
         AggregationMethod::FedAvg,
         AggregationMethod::Krum(1),
-        AggregationMethod::MultiKrum(1, 3),
+        AggregationMethod::MultiKrum(1, None),
     ];
 
     for method in methods {
@@ -190,7 +190,7 @@ fn aggregate_rejects_infinity() {
         AggregationMethod::Median,
         AggregationMethod::FedAvg,
         AggregationMethod::Krum(1),
-        AggregationMethod::MultiKrum(1, 3),
+        AggregationMethod::MultiKrum(1, None),
     ];
 
     for method in methods {
@@ -350,18 +350,18 @@ fn aggregator_multi_krum_rejects_invalid_condition() {
     // n=6, f=2 -> needs 7
     let updates: Vec<Array2<f32>> = (0..6).map(|i| array![[1.0 + i as f32 * 0.1]]).collect();
 
-    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(2, 3), 0.0);
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(2, None), 0.0);
     match agg.aggregate(&updates, None) {
         Err(QoraError::InsufficientQuorum { needed, actual }) => {
             assert_eq!(needed, 7);
             assert_eq!(actual, 6);
         }
-        other => panic!("MultiKrum(2, 3) with n=6 should be refused: {:?}", other),
+        other => panic!("MultiKrum(2, None) with n=6 should be refused: {:?}", other),
     }
 
     // n=7, f=2 is at the boundary and must succeed.
     let updates: Vec<Array2<f32>> = (0..7).map(|i| array![[1.0 + i as f32 * 0.1]]).collect();
-    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(2, 3), 0.0);
+    let mut agg = ByzantineAggregator::new(AggregationMethod::MultiKrum(2, None), 0.0);
     assert!(agg.aggregate(&updates, None).is_ok());
 }
 

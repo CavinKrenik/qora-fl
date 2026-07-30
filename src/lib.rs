@@ -9,7 +9,8 @@
 //! - [`median()`] - Coordinate-wise median (~50% Byzantine tolerance)
 //! - [`aggregate_krum()`] - Krum selection with I16F16 fixed-point (n >= 2f+3)
 //! - [`aggregate_krum_bfp16()`] - Krum selection with BFP-16 block floating-point (n >= 2f+3)
-//! - [`aggregate_multi_krum_bfp16()`] - Multi-Krum: top-m selection + averaging (n >= 2f+3)
+//! - [`aggregate_multi_krum_bfp16()`] - Multi-Krum: top-m selection + averaging
+//!   (n >= 2f+3, 1 <= m <= n-2f-2)
 //! - [`fedavg()`] - Standard FedAvg baseline (no Byzantine tolerance)
 //!
 //! ## High-Level API
@@ -65,9 +66,16 @@ mod python {
             "median" => Ok(AggregationMethod::Median),
             "fedavg" => Ok(AggregationMethod::FedAvg),
             s if s.starts_with("multi_krum") => {
-                // Accept "multi_krum" (f=1, m=3) or "multi_krum:f:m"
+                // Accept "multi_krum" (f=1, m capped to the safe maximum at
+                // aggregation time) or an explicit "multi_krum:f:m".
+                //
+                // The bare form must stay `None` rather than resolving to a
+                // literal here: only the aggregation boundary knows `n`, and
+                // an omitted m is capped to `min(3, n - 2f - 2)` while an
+                // explicit m out of range is rejected. Baking in a 3 would
+                // erase that distinction and break 5- and 6-client cohorts.
                 let (f, m) = if s == "multi_krum" {
-                    (1, 3)
+                    (1, None)
                 } else if let Some(params) = s.strip_prefix("multi_krum:") {
                     let parts: Vec<&str> = params.split(':').collect();
                     if parts.len() != 2 {
@@ -88,7 +96,7 @@ mod python {
                             parts[1], err_msg
                         ))
                     })?;
-                    (f, m)
+                    (f, Some(m))
                 } else {
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                         "Unknown method '{}'. {}",

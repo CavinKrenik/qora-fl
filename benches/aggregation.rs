@@ -43,7 +43,9 @@ fn bench_aggregation(c: &mut Criterion) {
                 |b, updates| {
                     b.iter(|| {
                         let mut agg =
-                            ByzantineAggregator::new(AggregationMethod::MultiKrum(1, 3), 0.0);
+                            // Explicit m=3: valid for every n benchmarked here
+                            // (f=1 gives a safe maximum of n-4 >= 6).
+                            ByzantineAggregator::new(AggregationMethod::MultiKrum(1, Some(3)), 0.0);
                         agg.aggregate(updates, None).unwrap()
                     })
                 },

@@ -9,7 +9,7 @@ use fixed::types::I16F16;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::verification::krum_condition::krum_condition_met;
+use crate::verification::krum_condition::{krum_condition_met, max_multi_krum_m};
 
 /// Block Floating Point Vector (BFP-16)
 /// Solves the "vanishing update" problem for low learning rates by using
@@ -296,17 +296,34 @@ pub fn aggregate_krum_bfp16(vectors: &[Bfp16Vec], f: usize) -> Option<usize> {
 /// When `m = 1`, equivalent to single Krum. Higher `m` gives a smoother
 /// result when the selected vectors are averaged.
 ///
-/// For full Byzantine tolerance, `m <= n - 2f - 2` (Blanchard et al., 2017).
+/// # Safety conditions
+///
+/// Both must hold, or this returns `None`:
+///
+/// * `n >= 2f + 3` -- the Krum quorum condition.
+/// * `1 <= m <= n - 2f - 2` (Blanchard et al., 2017).
+///
+/// Earlier versions documented the second condition but enforced only
+/// `m.max(1).min(n)`, so an oversized `m` produced a normal-looking result
+/// that carried no Byzantine guarantee -- the same failure the single-Krum
+/// "best-effort" path was removed for. Use
+/// [`crate::verification::max_multi_krum_m`] to compute a valid `m` for a
+/// given `(n, f)`.
 ///
 /// # Arguments
 /// * `vectors` - BFP-16 encoded model update vectors
 /// * `f` - Maximum number of Byzantine nodes expected
-/// * `m` - Number of vectors to select (clamped to n)
+/// * `m` - Number of vectors to select; must be in `1..=n - 2f - 2`
 pub fn aggregate_multi_krum_bfp16(vectors: &[Bfp16Vec], f: usize, m: usize) -> Option<Vec<usize>> {
+    // Checked before scoring: an out-of-range m makes the result unsound
+    // regardless of the scores, so there is no point computing them.
+    if m < 1 || m > max_multi_krum_m(vectors.len(), f) {
+        return None;
+    }
+
     let mut scores = compute_krum_scores_bfp16(vectors, f)?;
     scores.sort_by_key(|&(_, score)| score);
-    let m_eff = m.max(1).min(scores.len());
-    Some(scores.iter().take(m_eff).map(|&(idx, _)| idx).collect())
+    Some(scores.iter().take(m).map(|&(idx, _)| idx).collect())
 }
 
 #[cfg(test)]
@@ -549,27 +566,57 @@ mod tests {
 
     #[test]
     fn test_multi_krum_selects_honest() {
+        // n=7, f=1 -> max safe m = 3. Previously n=5, where the safe maximum
+        // is 1 and m=3 was silently clamped to n rather than refused.
         let vectors: Vec<Bfp16Vec> = vec![
             Bfp16Vec::from_f32_slice(&[1.0, 1.1]),
             Bfp16Vec::from_f32_slice(&[0.9, 1.0]),
             Bfp16Vec::from_f32_slice(&[1.05, 0.95]),
             Bfp16Vec::from_f32_slice(&[1.0, 1.0]),
+            Bfp16Vec::from_f32_slice(&[0.98, 1.02]),
+            Bfp16Vec::from_f32_slice(&[1.01, 0.99]),
             Bfp16Vec::from_f32_slice(&[100.0, 100.0]), // Byzantine
         ];
         let indices = aggregate_multi_krum_bfp16(&vectors, 1, 3).unwrap();
         assert_eq!(indices.len(), 3);
-        assert!(!indices.contains(&4), "Should not select Byzantine vector");
+        assert!(!indices.contains(&6), "Should not select Byzantine vector");
     }
 
+    /// Inverted from `test_multi_krum_m_clamped_to_n`, which asserted the old
+    /// behavior: an `m` above the safe maximum was clamped to `n` and returned
+    /// a normal-looking selection carrying no Byzantine guarantee.
     #[test]
-    fn test_multi_krum_m_clamped_to_n() {
+    fn test_multi_krum_rejects_m_above_safe_maximum() {
         let vectors: Vec<Bfp16Vec> = vec![
             Bfp16Vec::from_f32_slice(&[1.0]),
             Bfp16Vec::from_f32_slice(&[2.0]),
             Bfp16Vec::from_f32_slice(&[3.0]),
         ];
-        let indices = aggregate_multi_krum_bfp16(&vectors, 0, 100).unwrap();
-        assert_eq!(indices.len(), 3, "m should be clamped to n");
+        // n=3, f=0 -> max safe m = 1.
+        assert!(aggregate_multi_krum_bfp16(&vectors, 0, 100).is_none());
+        assert!(aggregate_multi_krum_bfp16(&vectors, 0, 2).is_none());
+        assert!(aggregate_multi_krum_bfp16(&vectors, 0, 1).is_some());
+    }
+
+    #[test]
+    fn test_multi_krum_rejects_zero_m() {
+        let vectors: Vec<Bfp16Vec> = (0..7)
+            .map(|i| Bfp16Vec::from_f32_slice(&[i as f32]))
+            .collect();
+        assert!(
+            aggregate_multi_krum_bfp16(&vectors, 1, 0).is_none(),
+            "m=0 selects nothing and cannot be averaged"
+        );
+    }
+
+    #[test]
+    fn test_multi_krum_honors_exact_safe_maximum() {
+        let vectors: Vec<Bfp16Vec> = (0..7)
+            .map(|i| Bfp16Vec::from_f32_slice(&[i as f32]))
+            .collect();
+        // n=7, f=1 -> max safe m = 3; m=4 is one past it.
+        assert_eq!(aggregate_multi_krum_bfp16(&vectors, 1, 3).unwrap().len(), 3);
+        assert!(aggregate_multi_krum_bfp16(&vectors, 1, 4).is_none());
     }
 
     #[test]

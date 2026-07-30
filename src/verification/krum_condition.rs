@@ -28,6 +28,23 @@ pub fn max_tolerable_f(n: usize) -> usize {
     }
 }
 
+/// Maximum number of vectors Multi-Krum may select for a given `(n, f)`.
+///
+/// Returns `n - 2f - 2` (Blanchard et al., 2017), or `0` when the Krum quorum
+/// condition `n >= 2f + 3` is not met -- selecting any number of vectors is
+/// unsound in that case, so there is no safe maximum to report.
+///
+/// Whenever the quorum condition *is* met the result is at least 1, since
+/// `n >= 2f + 3` implies `n - 2f - 2 >= 1`. A caller that has already checked
+/// [`krum_condition_met`] can therefore rely on a usable value.
+pub fn max_multi_krum_m(n: usize, f: usize) -> usize {
+    if !krum_condition_met(n, f) {
+        return 0;
+    }
+    // Safe: the quorum check above guarantees n >= 2f + 3 > 2f + 2.
+    n - 2 * f - 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +77,39 @@ mod tests {
         assert_eq!(max_tolerable_f(7), 2);
         assert_eq!(max_tolerable_f(10), 3);
         assert_eq!(max_tolerable_f(100), 48);
+    }
+
+    #[test]
+    fn test_max_multi_krum_m() {
+        // At exactly the quorum floor, only a single vector is selectable --
+        // Multi-Krum degenerates to single Krum.
+        assert_eq!(max_multi_krum_m(5, 1), 1); // 5 - 2 - 2
+        assert_eq!(max_multi_krum_m(6, 1), 2);
+        assert_eq!(max_multi_krum_m(7, 1), 3);
+        assert_eq!(max_multi_krum_m(7, 2), 1); // quorum floor for f=2
+        assert_eq!(max_multi_krum_m(12, 2), 6);
+        assert_eq!(max_multi_krum_m(10, 0), 8);
+    }
+
+    #[test]
+    fn test_max_multi_krum_m_is_zero_below_quorum() {
+        assert_eq!(max_multi_krum_m(4, 1), 0);
+        assert_eq!(max_multi_krum_m(6, 2), 0);
+        assert_eq!(max_multi_krum_m(0, 0), 0);
+        // Absurd f from untrusted input must not underflow.
+        assert_eq!(max_multi_krum_m(10, usize::MAX), 0);
+    }
+
+    #[test]
+    fn test_max_multi_krum_m_at_least_one_when_quorum_met() {
+        for f in 0..20 {
+            let n = krum_min_clients(f);
+            assert!(
+                max_multi_krum_m(n, f) >= 1,
+                "n={} f={} met quorum but reported no safe m",
+                n,
+                f
+            );
+        }
     }
 }

@@ -111,8 +111,21 @@ contradicted it.
   `None` caps to `min(3, n - 2f - 2)`, while `Some(m)` is honored exactly or
   refused. Without the distinction, a bare `"multi_krum"` could not both
   preserve the historical `m = 3` for large cohorts and stay inside the bound
-  for 5- and 6-client rounds. Changes the serialized shape of a persisted
-  `ByzantineAggregator`.
+  for 5- and 6-client rounds.
+
+  **Migration.** `Option<usize>` serializes untagged, so the JSON is
+  compatible in both directions: a 0.3.1 payload `{"MultiKrum":[1,3]}` still
+  deserializes under 0.4.0, as `MultiKrum(1, Some(3))`, and `Some(3)` still
+  serializes to `[1,3]`. The omitted form is the new `{"MultiKrum":[1,null]}`.
+
+  What changes is *meaning*, not shape. A persisted 0.3.1 configuration
+  restores as an **explicit** `m`, so a round where `m > n - 2f - 2` now fails
+  with `InvalidMultiKrumSelection` instead of silently clamping. That is the
+  intended effect of the fix, but it can surface at restore time rather than at
+  upgrade time. Operators restoring 0.3.1 state should either confirm the
+  stored `m` fits their smallest expected cohort, or rewrite the second element
+  to `null` to adopt the adaptive default. Rust callers constructing the enum
+  directly must update `MultiKrum(f, m)` to `MultiKrum(f, Some(m))`.
 - Python `"multi_krum"` (no parameters) now selects `min(3, n - 2f - 2)`
   vectors instead of a fixed 3, so 5- and 6-client rounds are safe rather than
   silently outside the guarantee. Explicit `"multi_krum:f:m"` is unchanged

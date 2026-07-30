@@ -260,6 +260,31 @@ fn both_forms_survive_serde_roundtrip() {
     }
 }
 
+/// A 0.3.1 payload predates the `Option` and must still load.
+///
+/// `Option<usize>` serializes untagged, so `[f, m]` remains valid JSON for the
+/// new shape and restores as an *explicit* `m` -- which is the correct reading
+/// of a configuration that was explicit when it was written.
+#[test]
+fn pre_option_json_still_deserializes_as_explicit_m() {
+    let restored: AggregationMethod =
+        serde_json::from_str(r#"{"MultiKrum":[1,3]}"#).expect("0.3.1 payload must still load");
+    assert_eq!(restored, AggregationMethod::MultiKrum(1, Some(3)));
+
+    // And the explicit form still round-trips to that same shape, so a 0.4.0
+    // writer stays readable by anything parsing the old layout.
+    assert_eq!(
+        serde_json::to_string(&AggregationMethod::MultiKrum(1, Some(3))).unwrap(),
+        r#"{"MultiKrum":[1,3]}"#
+    );
+
+    // The omitted form is the genuinely new encoding.
+    assert_eq!(
+        serde_json::to_string(&AggregationMethod::MultiKrum(1, None)).unwrap(),
+        r#"{"MultiKrum":[1,null]}"#
+    );
+}
+
 #[test]
 fn aggregator_with_bare_form_survives_serde_roundtrip() {
     let updates = spread_updates(6);

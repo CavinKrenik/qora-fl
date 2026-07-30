@@ -4,9 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-Input validation hardening. Every item below is a correctness/security fix: in
-each case the documented contract already existed and the implementation
-contradicted it.
+Input validation and numeric hardening. Every item below is a
+correctness/security fix: in each case the documented contract or the intended
+invariant already existed and the implementation contradicted it.
+
+Targeting **0.4.0**, not 0.3.2 — several changes are observable to callers, and
+under `^0.3` a patch release would reach them automatically rather than
+prompting a review. Version metadata in `Cargo.toml` and
+`bindings/python/pyproject.toml` deliberately **remains at `0.3.1`** until the
+release is actually cut; the API migrations recorded below take effect in
+0.4.0.
 
 ### Fixed
 
@@ -73,6 +80,91 @@ contradicted it.
   clients, because `update_reputations` zips and stops at the shorter side.
 
 ### Changed
+
+- **Reputation state now maintains a numeric invariant: every stored score is
+  finite and within `[0, 1]`, and every operation preserves it.** Each mutation
+  path previously had a way to break it, and the clamps intended to prevent
+  that were themselves the vulnerability:
+
+  | Call | Before | Now |
+  |---|---|---|
+  | `set_score(id, NaN)` | stored `NaN` (`f32::clamp` propagates it) | `InvalidReputationScore` |
+  | `reward(id, NaN)` | stored `1.0` (`f32::min` *discards* NaN) | `InvalidReputationAdjustment` |
+  | `penalize(id, NaN)` | stored `0.0` (`f32::max` discards NaN) | `InvalidReputationAdjustment` |
+  | `reward(id, -5.0)` | stored `-4.5` | `InvalidReputationAdjustment` |
+  | `penalize(id, -5.0)` | stored `5.5` | `InvalidReputationAdjustment` |
+  | `decay_toward_default(NaN)` | turned **every** score into `NaN` | `InvalidReputationDecay`, nothing mutated |
+
+  The NaN reward and penalty cases are the dangerous ones: they produced no
+  NaN at all, just a plausible extreme -- silently fully-trusted or silently
+  banned, with nothing for an operator to notice.
+
+  Invalid operations are atomic: the targeted score is unchanged and no other
+  entry is touched. The decay factor in particular is validated *before* the
+  mutation loop, so a rejected call cannot leave the store partially decayed.
+
+  Out-of-range values are **rejected, not clamped**. A caller passing `5.0`
+  has misread the scale, and silently storing `1.0` would conceal that.
+
+  The accepted ranges, in full:
+
+  | Input | Must be | Rejected with |
+  |---|---|---|
+  | Stored score | finite, `0.0 <= s <= 1.0` | `InvalidReputationScore` |
+  | Reward / penalty amount | finite, `>= 0.0` (any magnitude) | `InvalidReputationAdjustment` |
+  | Decay factor | finite, `0.0 <= f <= 1.0` | `InvalidReputationDecay` |
+  | Ban threshold | finite, `0.0 <= t <= 1.0` | `InvalidReputationThreshold` |
+
+  Only amounts are unbounded above, because the resulting score is clamped
+  after the arithmetic: `reward(id, 10.0)` still yields `1.0`, and
+  `penalize(id, 20.0)` still yields `0.0`. A decay factor of `0.0` is a no-op
+  and `1.0` restores the default.
+
+- **Reputation distance is computed in `f64`, with operands widened before
+  subtraction.** The previous `diff.iter().map(|x| x * x).sum::<f32>().sqrt()`
+  overflowed to infinity for large finite differences and underflowed to zero
+  for tiny ones. Casting the final sum would not have been enough: the `f32`
+  subtraction itself overflows before any wider arithmetic sees the values.
+  A non-finite distance now returns `QoraError::NonFiniteReputationDistance`
+  rather than being read as zero distance, which would mean maximum trust.
+
+- **Ban thresholds are validated.** `ByzantineAggregator::with_ban_threshold`
+  returns `Result` and rejects a non-finite or out-of-range threshold. This
+  closes a fail-open: gating activates on `ban_threshold > 0.0`, which is false
+  for `NaN`, so a non-finite threshold disabled the gate entirely while
+  appearing configured. Thresholds above the 0.5 default score remain valid --
+  they deliberately reject unknown clients.
+
+- **Deserialization enforces the same rules.** `ReputationStore` rejects a
+  payload containing a score outside `[0, 1]`, and a persisted
+  `ByzantineAggregator` with an invalid `ban_threshold` is refused. Without
+  this the guarantees would hold only for callers who never restore state.
+  Corrupted data is refused rather than silently clamped.
+
+- **Gating treats non-finite scores as untrusted.** `is_banned` and
+  `count_below` now count a non-finite score as below any threshold.
+  Enforcement should make this unreachable; it is defence in depth for state
+  written by an older version. Without it, `NaN < threshold` is false, so a
+  poisoned client was permanently *unbannable* and invisible to adaptive
+  trimming.
+
+  **Migration (0.4).** These mutation methods now return
+  `Result<(), QoraError>` instead of `()`, and `with_ban_threshold` returns
+  `Result<Self, QoraError>`:
+
+  | Method | Was | Now |
+  |---|---|---|
+  | `ReputationStore::{set_score, reward, penalize, decay_toward_default}` | `()` | `Result<(), QoraError>` |
+  | `ReputationTracker::decay_toward_default` | `()` | `Result<(), QoraError>` |
+  | `ByzantineAggregator::decay_reputations` | `()` | `Result<(), QoraError>` |
+  | `ByzantineAggregator::with_ban_threshold` | `Self` | `Result<Self, QoraError>` |
+
+  Rust callers must handle or propagate the result. `ReputationTracker`'s
+  `reward_valid_zkp`, `penalize_drift`, and `penalize_zkp_failure` keep their
+  infallible signatures: their amounts are crate constants validated at compile
+  time, so there is no runtime failure to report. In Python the same operations
+  raise `ValueError` through the existing error conversion; no new exception
+  type is introduced.
 
 - **Reputation participation gating now fails closed.** When every submitted
   client is below the configured `ban_threshold`, aggregation returns the new
@@ -172,6 +264,18 @@ contradicted it.
   maximum }` -- raised for an explicit `m` outside the safe range.
 - `QoraError::AllUpdatesRejected { total, rejected, threshold }` -- raised when
   reputation gating leaves no client.
+- `QoraError::InvalidReputationScore`, `InvalidReputationAdjustment`,
+  `InvalidReputationDecay`, `InvalidReputationThreshold`, and
+  `NonFiniteReputationDistance` -- typed rejections for each reputation input
+  class, so a caller can tell an invalid score from an invalid amount, decay
+  factor, or threshold.
+- `src/reputation/validate.rs`: the four numeric rules in one place, with the
+  reasoning for rejecting rather than clamping.
+- `tests/reputation_numeric.rs`: 27 integration tests covering each rejection,
+  atomicity of failed operations, saturation of large valid amounts,
+  deserialization rejection, and end-to-end aggregation keeping every score in
+  range. Plus unit tests for the read-side defences and for the `f64` distance
+  at both extremes, and 11 Python tests over the exposed methods.
 - `tests/reputation_gating.rs`: 12 integration tests covering the typed error
   and its fields, non-restoration of a partially rejected cohort, precedence
   over method execution, reputation state being unchanged on the error path,

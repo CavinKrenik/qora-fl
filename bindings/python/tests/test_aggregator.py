@@ -279,6 +279,101 @@ class TestReputationGatingFailsClosed:
             agg.aggregate(updates, ["a", "b", "c"])
 
 
+# --- Reputation numeric safety ---
+
+
+class TestReputationNumericValidation:
+    """Stored scores stay finite and within [0, 1].
+
+    Every rejected call must also leave the existing score untouched.
+    """
+
+    def test_set_score_rejects_non_finite(self):
+        rep = ReputationManager(ban_threshold=0.2)
+        rep.set_score("client", 0.7)
+
+        for bad in [float("nan"), float("inf"), float("-inf")]:
+            with pytest.raises(ValueError, match="reputation score"):
+                rep.set_score("client", bad)
+            assert abs(rep.get_score("client") - 0.7) < 1e-6
+
+    def test_set_score_rejects_out_of_range(self):
+        rep = ReputationManager(ban_threshold=0.2)
+        for bad in [-0.1, 1.1, 5.0]:
+            with pytest.raises(ValueError, match="reputation score"):
+                rep.set_score("client", bad)
+
+    def test_set_score_accepts_boundaries(self):
+        rep = ReputationManager(ban_threshold=0.2)
+        for good in [0.0, 0.5, 1.0]:
+            rep.set_score("client", good)
+            assert abs(rep.get_score("client") - good) < 1e-6
+
+    def test_reward_and_penalize_reject_non_finite(self):
+        rep = ReputationManager(ban_threshold=0.2)
+        rep.set_score("client", 0.4)
+
+        for bad in [float("nan"), float("inf"), float("-inf")]:
+            with pytest.raises(ValueError, match="reputation adjustment"):
+                rep.reward("client", bad)
+            with pytest.raises(ValueError, match="reputation adjustment"):
+                rep.penalize("client", bad)
+            # Pre-fix these silently produced 1.0 and 0.0 respectively.
+            assert abs(rep.get_score("client") - 0.4) < 1e-6
+
+    def test_reward_and_penalize_reject_negative_amounts(self):
+        rep = ReputationManager(ban_threshold=0.2)
+        rep.set_score("client", 0.4)
+
+        with pytest.raises(ValueError, match="reputation adjustment"):
+            rep.reward("client", -5.0)
+        with pytest.raises(ValueError, match="reputation adjustment"):
+            rep.penalize("client", -5.0)
+        assert abs(rep.get_score("client") - 0.4) < 1e-6
+
+    def test_large_valid_amounts_still_saturate(self):
+        rep = ReputationManager(ban_threshold=0.2)
+        rep.reward("client", 10.0)
+        assert rep.get_score("client") == 1.0
+        rep.penalize("client", 20.0)
+        assert rep.get_score("client") == 0.0
+
+    def test_decay_rejects_invalid_factors_without_mutating(self):
+        rep = ReputationManager(ban_threshold=0.2)
+        rep.set_score("a", 0.9)
+        rep.set_score("b", 0.1)
+
+        for bad in [float("nan"), float("inf"), -0.1, 1.1]:
+            with pytest.raises(ValueError, match="decay factor"):
+                rep.decay(bad)
+            # A single bad factor used to turn every score into NaN.
+            assert abs(rep.get_score("a") - 0.9) < 1e-6
+            assert abs(rep.get_score("b") - 0.1) < 1e-6
+
+    def test_valid_decay_still_works(self):
+        rep = ReputationManager(ban_threshold=0.2)
+        rep.set_score("a", 0.9)
+        rep.decay(1.0)
+        assert abs(rep.get_score("a") - 0.5) < 1e-6
+
+    def test_invalid_ban_threshold_is_rejected(self):
+        for bad in [float("nan"), float("inf"), -0.1, 1.1]:
+            with pytest.raises(ValueError, match="reputation threshold"):
+                ReputationManager(ban_threshold=bad)
+            with pytest.raises(ValueError, match="reputation threshold"):
+                ByzantineAggregator("fedavg", 0.0, ban_threshold=bad)
+
+    def test_persisted_out_of_range_score_is_rejected(self):
+        with pytest.raises(ValueError):
+            ReputationManager.from_json('{"mallory": 2.0}', ban_threshold=0.2)
+
+    def test_valid_persisted_state_still_restores(self):
+        rep = ReputationManager(ban_threshold=0.2)
+        rep.set_score("alice", 0.8)
+        restored = ReputationManager.from_json(rep.to_json(), ban_threshold=0.2)
+        assert abs(restored.get_score("alice") - 0.8) < 1e-6
+
+
 # --- ReputationManager ---
 
 

@@ -29,6 +29,8 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::error::QoraError;
+use crate::math::norms::l2_distance_f64;
+use crate::reputation::validate::validate_threshold;
 use crate::reputation::ReputationStore;
 use crate::validation::{validate_client_ids, validate_updates};
 use crate::verification::krum_condition::{krum_condition_met, krum_min_clients, max_multi_krum_m};
@@ -37,6 +39,36 @@ use crate::verification::krum_condition::{krum_condition_met, krum_min_clients, 
 /// maximum. Chosen to preserve the historical default for cohorts large enough
 /// to support it.
 const DEFAULT_MULTI_KRUM_M: usize = 3;
+
+/// Distance below which a client is treated as agreeing with the aggregate.
+const REWARD_DISTANCE: f64 = 1.0;
+
+/// Distance above which a client is treated as deviating from the aggregate.
+const PENALTY_DISTANCE: f64 = 10.0;
+
+/// Reputation gained by a client close to the aggregate.
+const CLOSE_UPDATE_REWARD: f32 = 0.02;
+
+/// Reputation lost by a client far from the aggregate.
+const FAR_UPDATE_PENALTY: f32 = 0.08;
+
+// Both adjustments feed validated store operations. Checked at compile time so
+// the `?` on those calls is provably unreachable rather than merely unlikely.
+const _: () = assert!(CLOSE_UPDATE_REWARD >= 0.0 && CLOSE_UPDATE_REWARD <= 1.0);
+const _: () = assert!(FAR_UPDATE_PENALTY >= 0.0 && FAR_UPDATE_PENALTY <= 1.0);
+
+/// Reject a persisted ban threshold that would not be accepted at construction.
+fn deserialize_ban_threshold<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = f32::deserialize(deserializer)?;
+    validate_threshold(value)
+        .map_err(|e| D::Error::custom(format!("{}", e)))
+        .map(|_| value)
+}
 
 /// Aggregation method selection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -101,6 +133,11 @@ pub struct ByzantineAggregator {
     reputation: ReputationStore<String>,
     /// Clients below this reputation score are excluded from aggregation.
     /// Default: 0.0 (no gating). Set to e.g. 0.2 to enable ban gating.
+    ///
+    /// Validated on deserialization as well as on construction: restoring a
+    /// persisted aggregator is a configuration path like any other, and a
+    /// non-finite threshold here silently disables gating.
+    #[serde(deserialize_with = "deserialize_ban_threshold")]
     ban_threshold: f32,
     /// When true and method is TrimmedMean, compute trim_fraction dynamically
     /// from client reputation distribution each round.
@@ -137,18 +174,26 @@ impl ByzantineAggregator {
     /// [`crate::reputation::store::DEFAULT_SCORE`] (0.5), so a threshold above
     /// that rejects every first-time participant -- which is now an error
     /// rather than a silently ungated round.
+    ///
+    /// # Errors
+    ///
+    /// [`QoraError::InvalidReputationThreshold`] if `ban_threshold` is not
+    /// finite and within `[0.0, 1.0]`. This is not cosmetic: gating activates
+    /// on `ban_threshold > 0.0`, which is false for NaN, so a non-finite
+    /// threshold used to disable the gate entirely while appearing configured.
     pub fn with_ban_threshold(
         method: AggregationMethod,
         trim_fraction: f32,
         ban_threshold: f32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, QoraError> {
+        validate_threshold(ban_threshold)?;
+        Ok(Self {
             method,
             trim_fraction,
             reputation: ReputationStore::new(),
             ban_threshold,
             adaptive_trim: false,
-        }
+        })
     }
 
     /// Enable or disable adaptive trimming.
@@ -330,7 +375,7 @@ impl ByzantineAggregator {
 
         // Track reputation based on distance to aggregate
         if let Some(ref ids) = filtered_ids {
-            self.update_reputations(ids, agg_updates, &result);
+            self.update_reputations(ids, agg_updates, &result)?;
         }
 
         Ok(result)
@@ -353,9 +398,14 @@ impl ByzantineAggregator {
     ///
     /// # Arguments
     ///
-    /// * `rate` - Decay rate in (0.0, 1.0). Typical: 0.01-0.05 per round.
-    pub fn decay_reputations(&mut self, rate: f32) {
-        self.reputation.decay_toward_default(rate);
+    /// * `rate` - Decay rate in `[0.0, 1.0]`. Typical: 0.01-0.05 per round.
+    ///
+    /// # Errors
+    ///
+    /// [`QoraError::InvalidReputationDecay`] if `rate` is not finite and
+    /// within `[0.0, 1.0]`. No score changes when the rate is rejected.
+    pub fn decay_reputations(&mut self, rate: f32) -> Result<(), QoraError> {
+        self.reputation.decay_toward_default(rate)
     }
 
     /// Get the ban threshold for this aggregator.
@@ -364,22 +414,45 @@ impl ByzantineAggregator {
     }
 
     /// Update reputations based on how close each client's update is to the aggregate.
+    ///
+    /// The distance is accumulated in `f64` with operands widened before
+    /// subtraction. In `f32` it had both failure directions: large finite
+    /// differences overflowed to infinity and triggered a penalty based on the
+    /// overflow rather than the actual deviation, while tiny differences
+    /// underflowed to zero and earned a reward for a distance that was never
+    /// measured.
+    ///
+    /// # Errors
+    ///
+    /// [`QoraError::NonFiniteReputationDistance`] if a distance is not finite.
+    /// Updates are validated finite and the accumulation is `f64`, so this
+    /// should be unreachable; it is reported rather than being treated as zero
+    /// distance, which would read as maximum trust.
     fn update_reputations(
         &mut self,
         client_ids: &[String],
         updates: &[Array2<f32>],
         result: &Array2<f32>,
-    ) {
+    ) -> Result<(), QoraError> {
         for (id, update) in client_ids.iter().zip(updates.iter()) {
-            let diff = update - result;
-            let distance: f32 = diff.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let distance = l2_distance_f64(update.iter(), result.iter());
 
-            if distance < 1.0 {
-                self.reputation.reward(id.clone(), 0.02);
-            } else if distance > 10.0 {
-                self.reputation.penalize(id.clone(), 0.08);
+            if !distance.is_finite() {
+                return Err(QoraError::NonFiniteReputationDistance {
+                    client_id: id.clone(),
+                    value: distance,
+                });
+            }
+
+            // Thresholds compared in f64 so the widened distance is not
+            // narrowed back down before the decision.
+            if distance < REWARD_DISTANCE {
+                self.reputation.reward(id.clone(), CLOSE_UPDATE_REWARD)?;
+            } else if distance > PENALTY_DISTANCE {
+                self.reputation.penalize(id.clone(), FAR_UPDATE_PENALTY)?;
             }
         }
+        Ok(())
     }
 }
 

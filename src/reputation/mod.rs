@@ -7,6 +7,27 @@
 //! is detected during aggregation. Used to weight clients in
 //! Byzantine-tolerant aggregation.
 //!
+//! # Numeric invariant
+//!
+//! Every stored score is finite and within `[0.0, 1.0]`, and every operation
+//! preserves that:
+//!
+//! * Scores must be finite and in `[0.0, 1.0]`. Out-of-range values are
+//!   rejected rather than clamped.
+//! * Reward and penalty amounts must be finite and non-negative. Large finite
+//!   amounts are accepted and saturate at the boundary.
+//! * Decay factors must be finite and in `[0.0, 1.0]`.
+//! * Invalid operations return a typed error and mutate nothing -- not the
+//!   targeted entry, and not any other.
+//! * Deserialization enforces the same rules, so persisted state cannot
+//!   reintroduce a value the setters reject.
+//! * Non-finite scores encountered on the read side are treated conservatively
+//!   as untrusted (banned, and counted as below any threshold), as defence
+//!   against state this version did not write.
+//!
+//! Distances driving reputation updates are accumulated in `f64` with operands
+//! widened before subtraction; see [`crate::math::norms`].
+//!
 //! # Influence Formula: `min(rep^3, 0.8)`
 //!
 //! The cubic weighting `rep^3` was chosen over linear or quadratic schemes for
@@ -30,6 +51,7 @@
 //! outcome, which requires many colluding high-reputation nodes rather than just one.
 
 pub mod store;
+pub(crate) mod validate;
 
 pub use store::ReputationStore;
 
@@ -52,6 +74,32 @@ const BAN_THRESHOLD: f32 = 0.2;
 
 /// Maximum influence cap factor for rep^3 weighting (mitigates Slander-Amplification).
 const INFLUENCE_CAP: f32 = 0.8;
+
+// Every constant above is fed straight into a validated store operation.
+// Checking them at compile time is what lets the wrappers below keep
+// infallible signatures: a caller cannot supply these values, so there is no
+// runtime failure to report. `0.0 <= x && x <= 1.0` is false for NaN and for
+// both infinities, so this also establishes finiteness.
+const _: () = assert!(ZKP_REWARD >= 0.0 && ZKP_REWARD <= 1.0);
+const _: () = assert!(DRIFT_PENALTY >= 0.0 && DRIFT_PENALTY <= 1.0);
+const _: () = assert!(ZKP_FAILURE_PENALTY >= 0.0 && ZKP_FAILURE_PENALTY <= 1.0);
+const _: () = assert!(BAN_THRESHOLD >= 0.0 && BAN_THRESHOLD <= 1.0);
+const _: () = assert!(INFLUENCE_CAP >= 0.0 && INFLUENCE_CAP <= 1.0);
+
+/// The fixed adjustments [`ReputationTracker`] can apply.
+///
+/// A closed set of compile-time-validated constants, deliberately not an
+/// `f32`: it makes the infallible wrappers below unable to carry a
+/// caller-supplied amount into the one place a checked result is discarded.
+/// Private to this module and never exposed.
+enum ConstAdjustment {
+    /// [`ZKP_REWARD`]
+    ZkpReward,
+    /// [`DRIFT_PENALTY`]
+    Drift,
+    /// [`ZKP_FAILURE_PENALTY`]
+    ZkpFailure,
+}
 
 /// Reputation tracker for swarm peers.
 ///
@@ -92,18 +140,50 @@ impl ReputationTracker {
     }
 
     /// Reward a peer for submitting a valid ZKP
+    ///
+    /// Infallible: the amount is the crate constant `ZKP_REWARD`, validated at
+    /// compile time, so the underlying checked call cannot fail.
     pub fn reward_valid_zkp(&mut self, peer: &PeerId) {
-        self.inner.reward(*peer, ZKP_REWARD);
+        self.apply(peer, ConstAdjustment::ZkpReward);
     }
 
     /// Penalize a peer for drift detected during aggregation
+    ///
+    /// Infallible for the same reason as [`Self::reward_valid_zkp`].
     pub fn penalize_drift(&mut self, peer: &PeerId) {
-        self.inner.penalize(*peer, DRIFT_PENALTY);
+        self.apply(peer, ConstAdjustment::Drift);
     }
 
     /// Penalize a peer for failed ZKP verification
+    ///
+    /// Infallible for the same reason as [`Self::reward_valid_zkp`].
     pub fn penalize_zkp_failure(&mut self, peer: &PeerId) {
-        self.inner.penalize(*peer, ZKP_FAILURE_PENALTY);
+        self.apply(peer, ConstAdjustment::ZkpFailure);
+    }
+
+    /// Apply one of the fixed adjustments above.
+    ///
+    /// The single place in the crate where a checked reputation result is
+    /// discarded, so the justification lives in one spot. It takes a
+    /// [`ConstAdjustment`] rather than an `f32` or a closure specifically so
+    /// that it cannot become an unchecked route for a caller-supplied amount:
+    /// the only expressible amounts are the compile-time-validated constants,
+    /// and adding another means adding a variant *and* its `const` assertion.
+    ///
+    /// The `debug_assert` is the backstop for that -- a future constant that
+    /// somehow violated the invariant would surface as a test failure rather
+    /// than a silently dropped error.
+    fn apply(&mut self, peer: &PeerId, adjustment: ConstAdjustment) {
+        let result = match adjustment {
+            ConstAdjustment::ZkpReward => self.inner.reward(*peer, ZKP_REWARD),
+            ConstAdjustment::Drift => self.inner.penalize(*peer, DRIFT_PENALTY),
+            ConstAdjustment::ZkpFailure => self.inner.penalize(*peer, ZKP_FAILURE_PENALTY),
+        };
+        debug_assert!(
+            result.is_ok(),
+            "reputation constants are compile-time validated: {:?}",
+            result
+        );
     }
 
     /// Get all non-banned peers and their scores
@@ -148,9 +228,15 @@ impl ReputationTracker {
     /// Apply reputation decay toward the default trust score (0.5).
     ///
     /// # Arguments
-    /// * `rate` - Decay rate in (0.0, 1.0). Typical: 0.01-0.05 per round.
-    pub fn decay_toward_default(&mut self, rate: f32) {
-        self.inner.decay_toward_default(rate);
+    /// * `rate` - Decay rate in `[0.0, 1.0]`. Typical: 0.01-0.05 per round.
+    ///
+    /// # Errors
+    ///
+    /// [`QoraError::InvalidReputationDecay`](crate::QoraError::InvalidReputationDecay)
+    /// if `rate` is not finite and within `[0.0, 1.0]`. No score changes when
+    /// the rate is rejected.
+    pub fn decay_toward_default(&mut self, rate: f32) -> Result<(), crate::error::QoraError> {
+        self.inner.decay_toward_default(rate)
     }
 
     /// Remove peers whose score is within `epsilon` of the default (0.5).

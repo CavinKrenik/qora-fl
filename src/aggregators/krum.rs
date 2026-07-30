@@ -30,7 +30,7 @@ impl Bfp16Vec {
     ///
     /// This function **assumes `data` contains no NaN or infinity** and does
     /// not check. Callers inside this crate satisfy that via
-    /// [`crate::aggregators::validate::validate_updates`], which
+    /// `crate::validation::validate_updates`, which
     /// [`crate::ByzantineAggregator::aggregate`] runs before encoding.
     ///
     /// Non-finite input is silently laundered rather than rejected:

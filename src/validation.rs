@@ -1,10 +1,16 @@
-//! Shared input validation for all aggregation methods.
+//! Shared input validation.
+//!
+//! Cross-cutting infrastructure, private to the crate and deliberately placed
+//! at the root rather than under `aggregators`: both `aggregators` and
+//! `verification` need it, and `aggregators` already depends on
+//! `verification`, so hosting it under either one would create a cycle.
 //!
 //! Every aggregation entry point runs [`validate_updates`] before touching
-//! client data. Centralizing the checks here means the guarantee holds
-//! regardless of whether callers use [`crate::ByzantineAggregator`] or call
-//! the free functions ([`crate::trimmed_mean`], [`crate::median`],
-//! [`crate::fedavg`]) directly.
+//! client data, as does [`crate::verification::check_norm_bound`].
+//! Centralizing the checks here means the guarantee holds regardless of
+//! whether callers use [`crate::ByzantineAggregator`] or call the free
+//! functions ([`crate::trimmed_mean`], [`crate::median`], [`crate::fedavg`])
+//! directly.
 //!
 //! # Why non-finite values must be rejected, not sanitized
 //!

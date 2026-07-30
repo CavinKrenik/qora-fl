@@ -16,7 +16,6 @@ pub mod fedavg;
 pub mod krum;
 pub mod median;
 pub mod trimmed_mean;
-pub mod validate;
 
 pub use fedavg::fedavg;
 pub use krum::aggregate_krum;
@@ -24,7 +23,6 @@ pub use krum::aggregate_krum_bfp16;
 pub use krum::aggregate_multi_krum_bfp16;
 pub use median::median;
 pub use trimmed_mean::trimmed_mean;
-pub use validate::validate_updates;
 
 use ndarray::Array2;
 
@@ -32,8 +30,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::QoraError;
 use crate::reputation::ReputationStore;
+use crate::validation::{validate_client_ids, validate_updates};
 use crate::verification::krum_condition::krum_min_clients;
-use validate::validate_client_ids;
 
 /// Aggregation method selection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

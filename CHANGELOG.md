@@ -8,11 +8,29 @@ Input validation hardening. Every item below is a correctness/security fix: in
 each case the documented contract already existed and the implementation
 contradicted it.
 
+### Fixed
+
+- Norm-bound verification now computes L2 norms with `f64` accumulation,
+  preventing finite large updates from overflowing to infinity and very small
+  updates from underflowing to zero.
+- `check_norm_bound` now rejects non-finite update coordinates with
+  `QoraError::NonFiniteValue`.
+- Zero, negative, NaN, and infinite norm bounds now return
+  `QoraError::InvalidNormBound`.
+- Norm-bound rejection messages now report the finite computed norm using
+  scientific notation.
+
+### Deprecated
+
+- `filter_by_norm_bound` is deprecated because it silently discards
+  verification errors. Callers should use `check_norm_bound` and handle each
+  result explicitly.
+
 ### Security
 
 - **Non-finite values in client updates are now rejected** instead of silently
   corrupting the aggregate. New `QoraError::NonFiniteValue { update_index, row,
-  col, value }`, enforced by `aggregators::validate::validate_updates` and
+  col, value }`, enforced by `validation::validate_updates` and
   called from `ByzantineAggregator::aggregate` as well as from `trimmed_mean`,
   `median`, and `fedavg` directly, so the guarantee does not depend on which
   entry point a caller uses.
@@ -77,12 +95,21 @@ contradicted it.
 - In `trimmed_mean`, update validation now runs before the `trim_fraction`
   range check. A call with both a dimension mismatch and an out-of-range
   fraction now reports `DimensionMismatch` rather than `InvalidTrimFraction`.
+- `l2_norm` now uses an internal `f64` accumulator before returning `f32`,
+  improving accuracy at extreme finite magnitudes.
+- `l2_norm_sq` is documented as able to overflow to infinity or underflow to
+  zero when the true squared norm falls outside `f32` range. This is a
+  limitation of its return type rather than of its accumulation, so it cannot
+  be removed without changing the signature; verification uses `l2_norm`
+  instead.
 
 ### Added
 
-- `src/aggregators/validate.rs`: `validate_updates`, `validate_weights`,
+- `src/validation.rs`: `validate_updates`, `validate_weights`,
   `validate_client_ids`, plus module documentation recording why non-finite
-  input is rejected rather than sanitized.
+  input is rejected rather than sanitized. Crate-private, and located at the
+  crate root rather than under `aggregators` because `verification` needs it
+  too and `aggregators` already depends on `verification`.
 - `verification::krum_min_clients(f)` -- minimum client count for a given `f`,
   with saturating arithmetic. Re-exported from `verification`.
 - `docs/SECURITY_NOTES.md` recording the measured pre-fix behavior behind each

@@ -73,6 +73,20 @@ pub enum QoraError {
     #[error("Verification failed: {0}")]
     VerificationError(String),
 
+    /// A norm bound is not a usable threshold
+    ///
+    /// A bound must be finite and strictly positive. Zero and negative bounds
+    /// reject every possible update; an infinite bound accepts every update
+    /// regardless of its norm; a NaN bound rejects every update because every
+    /// comparison against NaN is false. All four are caller misconfiguration,
+    /// not verification failures, and are reported separately so that a caller
+    /// can distinguish an unusable threshold from a genuinely oversized update.
+    #[error("Invalid norm bound: {value} (must be finite and > 0)")]
+    InvalidNormBound {
+        /// The offending bound
+        value: f32,
+    },
+
     /// Array shape mismatch
     #[error("Array shape error: {0}")]
     ShapeError(String),

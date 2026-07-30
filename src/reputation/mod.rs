@@ -30,8 +30,17 @@
 //!
 //! # Influence Formula: `min(rep^3, 0.8)`
 //!
+//! Cubic influence weighting and its cap are available as utilities --
+//! [`ReputationStore::influence_weight`] and the tracker wrappers compute them,
+//! and a caller may use those values directly. The **primary aggregation path
+//! does not currently consume them**: reputation gates participation rather
+//! than weighting accepted updates. Reputation-weighted robust aggregation is
+//! roadmap work.
+//!
 //! The cubic weighting `rep^3` was chosen over linear or quadratic schemes for
-//! two empirical reasons observed during the 181-day QRES deployment:
+//! two reasons observed in the earlier QRES experiments (see the project
+//! history section of the README -- those results are lineage, not evidence
+//! about Qora-FL):
 //!
 //! 1. **Separation**: Cubic weighting amplifies the gap between honest (R≈0.7-1.0)
 //!    and marginal (R≈0.3-0.5) clients. At R=0.5, influence is only 0.125 (12.5%
@@ -44,11 +53,11 @@
 //!    swings. Cubic provides a smooth gradient that is steep enough for security
 //!    but forgiving enough for clients recovering from transient faults.
 //!
-//! The 0.8 cap (INFLUENCE_CAP) bounds any single node's contribution even at R=1.0,
-//! preventing the "Slander-Amplification" vulnerability where a coalition of
-//! high-reputation nodes could dominate consensus and collectively penalize honest
-//! newcomers. With the cap, a coalition needs >80% of total weight to control the
-//! outcome, which requires many colluding high-reputation nodes rather than just one.
+//! The 0.8 cap (INFLUENCE_CAP) bounds any single node's computed weight even at
+//! R=1.0, limiting how far one high-reputation node could dominate a weighted
+//! scheme built on these values. Because the default aggregation workflow does
+//! not consume the weights, the cap does not provide protection for that
+//! workflow -- it applies to whatever a caller builds on the utility.
 
 pub mod store;
 pub(crate) mod validate;
@@ -72,7 +81,8 @@ const ZKP_FAILURE_PENALTY: f32 = 0.15;
 /// Ban threshold: peers below this score are excluded
 const BAN_THRESHOLD: f32 = 0.2;
 
-/// Maximum influence cap factor for rep^3 weighting (mitigates Slander-Amplification).
+/// Maximum influence cap factor for rep^3 weighting. Available to callers via
+/// the influence utilities; not consumed by the default aggregation path.
 const INFLUENCE_CAP: f32 = 0.8;
 
 // Every constant above is fed straight into a validated store operation.

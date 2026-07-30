@@ -13,21 +13,58 @@ Please report security vulnerabilities via [GitHub private security advisories](
 
 Do not open public issues for security vulnerabilities.
 
-## Scope
+## Project status
 
-Qora-FL's security scope includes:
+Qora-FL is experimental and has **not received an independent security review**.
+What follows describes implemented behavior and its limits, not an audited
+guarantee.
 
-- Correctness of Byzantine-tolerant aggregation under documented threat models
-- Integrity of the deterministic (Q16.16) execution path
-- Soundness of the reputation gating mechanism
+## What Qora-FL does
 
-Qora-FL does **not** provide:
+Enforced in code and covered by the automated test suite:
 
-- Encrypted communication between FL clients and server
+- Rejects malformed input: dimension mismatches, non-finite values, and
+  `client_ids` that do not align with the supplied updates
+- Enforces Krum's `n >= 2f + 3` quorum condition, refusing configurations that
+  violate it rather than proceeding best-effort
+- Enforces Multi-Krum's selection bound `1 <= m <= n - 2f - 2`
+- Maintains reputation numeric invariants: stored scores are finite and within
+  `[0, 1]`, and invalid mutations are rejected without changing state
+- Fails closed when reputation gating rejects every identified client
+- Provides implementations of trimmed mean, coordinate-wise median, Krum, and
+  Multi-Krum
+
+## What Qora-FL does not provide
+
+- Detection of every poisoning attack
+- Correctness when an algorithm's assumptions are violated
+- Confidentiality of client updates
 - Authentication of client identities
-- Protection against Sybil attacks (multiple identities controlled by one adversary)
-- Differential privacy guarantees on model updates
+- Secure transport
+- Differential privacy
+- Sybil resistance
+- Cryptographic verification of updates
+- Protection against a malicious *server*
+- Protection against operator misconfiguration
+- Production-readiness or independent audit
 
-## Threat Model
+## Threat model
 
-Qora-FL assumes an honest-majority setting where up to 30% of participating clients may be Byzantine (arbitrary behavior). The aggregation algorithms are designed to produce correct results under this assumption. Exceeding the documented Byzantine tolerance bounds (e.g., >30% for trimmed mean, >50% for median) voids correctness guarantees.
+Each aggregation method carries its own assumption; there is no single
+project-wide adversarial percentage.
+
+| Method | Assumption |
+|---|---|
+| Trimmed mean | Depends on the configured trim fraction, adversarial proportion, attack model, and honest-update distribution. A trim fraction is not a tolerated attacker percentage. |
+| Coordinate-wise median | Strictly fewer than 50% adversarial values per coordinate |
+| Krum | `n >= 2f + 3`, with `f` an honest upper bound on Byzantine clients |
+| Multi-Krum | `n >= 2f + 3` and `1 <= m <= n - 2f - 2` |
+| FedAvg | None. Baseline only; no Byzantine robustness. |
+
+Algorithmic robustness is not the same as security. These methods bound the
+influence of deviating updates under stated statistical assumptions; they do
+not authenticate participants, protect confidentiality, or resist an adversary
+who controls enough of the cohort to satisfy none of the assumptions above.
+
+`f` is a **configured** bound. If more than `f` clients are Byzantine, Krum's
+guarantee does not hold regardless of what the code enforces.

@@ -5,8 +5,10 @@
 //!
 //! ## Aggregation Methods
 //!
-//! - [`trimmed_mean()`] - Coordinate-wise trimmed mean (~30% Byzantine tolerance)
-//! - [`median()`] - Coordinate-wise median (~50% Byzantine tolerance)
+//! - [`trimmed_mean()`] - Coordinate-wise trimmed mean; robustness depends on
+//!   the trim fraction and attack model
+//! - [`median()`] - Coordinate-wise median; requires strictly <50% adversarial
+//!   values per coordinate
 //! - [`aggregate_krum()`] - Krum selection with I16F16 fixed-point (n >= 2f+3)
 //! - [`aggregate_krum_bfp16()`] - Krum selection with BFP-16 block floating-point (n >= 2f+3)
 //! - [`aggregate_multi_krum_bfp16()`] - Multi-Krum: top-m selection + averaging

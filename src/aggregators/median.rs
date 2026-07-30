@@ -1,7 +1,7 @@
 //! Coordinate-wise median aggregation
 //!
-//! More robust than trimmed mean but slower. Can theoretically handle
-//! up to 50% Byzantine clients; validated at 30% in QRES experiments.
+//! Requires strictly fewer than 50% adversarial values per coordinate for an
+//! honest majority. Exactly 50% is not strictly fewer than half.
 
 use ndarray::Array2;
 use rayon::prelude::*;
@@ -14,10 +14,11 @@ use crate::validation::validate_updates;
 /// For each parameter coordinate, computes the median across all client updates.
 /// The median is inherently robust to outliers since it selects the middle value.
 ///
-/// # Byzantine Tolerance
+/// # Assumptions
 ///
-/// Can theoretically handle up to 50% Byzantine clients (the median is unchanged
-/// as long as the majority is honest). In practice, validated at 30% in QRES.
+/// Requires **strictly fewer than 50%** adversarial values in each coordinate:
+/// the median is unchanged only while an honest majority holds. Exactly 50% is
+/// not strictly fewer than half and carries no guarantee.
 ///
 /// # Arguments
 ///

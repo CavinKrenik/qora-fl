@@ -12,27 +12,48 @@
 Federated learning systems are fragile under adversarial or faulty clients.
 Standard aggregation methods silently fail under model poisoning, gradient manipulation, or non-IID drift.
 
-Qora-FL provides quorum-oriented, Byzantine-tolerant aggregation primitives designed for predictable behavior under adversarial conditions, with optional determinism and reputation-aware filtering. Replace FedAvg with a single line change and tolerate up to 30% malicious clients.
+Qora-FL provides Rust-backed robust aggregation methods for federated learning.
+Each method has explicit assumptions and tolerance conditions, documented below.
+The included experiments evaluate selected attacks with up to 30% adversarial
+clients.
 
-## How Qora-FL Differs
+> [!IMPORTANT]
+> Qora-FL is an experimental robust-aggregation toolkit. Its algorithms are
+> implemented and tested, but the project has not received an independent
+> security review. Robustness depends on each method's stated assumptions,
+> threat model, and correct configuration.
 
-Most "robust FL" implementations are paper artifacts or tightly coupled experiments.
-Qora-FL is designed as **infrastructure**, emphasizing:
+## Currently implemented
 
-- **Explicit aggregation semantics** -- each method has documented tolerance bounds, not just "robust"
-- **Measurable deviation signals** -- reputation is derived from observable behavior, not assumed trust
-- **Deterministic execution paths** -- BFP-16 block floating-point for deterministic Krum/Multi-Krum distance computation
-- **Ecosystem integration** -- Flower-compatible strategy adapter, not a standalone experiment
-- **Benchmarked overhead** -- sub-10ms aggregation for 100K parameters, not just accuracy claims
+Behavior available through tested public paths:
 
-| Feature | FedAvg | Typical Robust FL | Qora-FL |
-|---------|--------|-------------------|---------|
-| Byzantine tolerance | -- | Paper-only | Algorithms informed by 181-day QRES deployment |
-| Deterministic option | -- | -- | BFP-16 block floating-point |
-| Reputation tracking | -- | -- | Deviation-derived, persistent |
-| Flower integration | Native | -- | `QoraStrategy` adapter |
-| Benchmarked overhead | -- | -- | <10ms / 100K params |
-| Production API | Partial | -- | Rust core + Python bindings |
+- FedAvg baseline, with optional sample-count weighting
+- Coordinate-wise median
+- Coordinate-wise trimmed mean
+- Krum and Multi-Krum, with their preconditions enforced
+- Input validation: dimensions, non-finite rejection, client-ID alignment
+- Krum quorum enforcement (`n >= 2f + 3`)
+- Multi-Krum selection-bound enforcement (`1 <= m <= n - 2f - 2`)
+- Reputation tracking and participation gating
+- Fail-closed behavior when gating rejects every client
+- Reputation numeric invariants (scores finite and within `[0, 1]`)
+- Rust API and Python bindings
+- Flower-compatible strategy adapter
+- Rust CI across three operating systems; Python CI including the adapter
+
+## Experimental or planned
+
+Present in the codebase but **not** wired into the normal aggregation path, or
+not yet implemented:
+
+- Reputation-weighted robust aggregation (cubic influence weighting exists as a
+  utility only)
+- Optional norm-bound filtering during aggregation
+- Broader audit records
+- Cross-platform bit-identical end-to-end aggregation
+- Independent security review
+- Real-world deployment validation
+- Additional attack and dataset evaluations
 
 ## Architecture
 
@@ -44,10 +65,11 @@ Clients produce model updates
 │   Qora Robust Aggregator       │
 │                                │
 │  ┌──────────────────────────┐  │
-│  │ Trimmed Mean    (~30%)   │  │
-│  │ Median          (~50%)   │  │
+│  │ Trimmed Mean             │  │
+│  │ Median                   │  │
 │  │ Krum       (n ≥ 2f+3)    │  │
-│  │ Multi-Krum  (top-m avg)  │  │
+│  │ Multi-Krum (n ≥ 2f+3,    │  │
+│  │        1 ≤ m ≤ n-2f-2)   │  │
 │  │ FedAvg      (baseline)   │  │
 │  └──────────────────────────┘  │
 └─────────────┬──────────────────┘
@@ -59,37 +81,67 @@ Clients produce model updates
      │    Reputation   │
      │     Manager     │
      │                 │
-     │  Scores / Gates │
-     │  / Weighting    │
+     │ Scores / Gates  │
      └────────┬────────┘
               │
               ▼
-     Verified Global Update
+        Global Update
 ```
 
-## Determinism & Reproducibility
+Gating runs *before* aggregation and reputation is updated *after* it. Scores
+do not weight accepted updates -- see [Reputation](#reputation).
 
-Floating-point aggregation is not reproducible across platforms or runtimes.
-Qora-FL supports **deterministic aggregation paths** via BFP-16 (block floating-point with 16-bit mantissas and per-vector shared exponent), enabling:
+## Determinism
 
-- **Reproducible experiments** -- identical Krum/Multi-Krum rankings regardless of hardware, compiler, or optimization level
-- **Auditability** -- any party can verify the exact aggregation result from the same inputs
-- **Consensus-style FL** -- bit-perfect agreement required for regulated industries (healthcare, finance)
+Qora-FL uses integer arithmetic for Krum distance and score calculations after
+BFP-16 encoding (block floating-point, 16-bit mantissas, per-vector shared
+exponent). Identical BFP-encoded inputs therefore produce deterministic Krum
+scores and rankings.
 
-BFP-16 extends the original Q16.16 fixed-point approach to cover the full `f32` range. Distance computations use purely integer arithmetic (i32 shifts, i64 accumulation, saturating operations). The deterministic Krum implementation was validated across ARM Cortex-M, Xtensa (ESP32), and x86_64 during the 181-day QRES deployment.
+**Full cross-platform bit-identical aggregation is not currently guaranteed.**
+The pipeline is only partly integer:
 
-## Reputation as a First-Class Primitive
+| Stage | Arithmetic |
+|---|---|
+| BFP-16 encoding | floating-point (`log2`, scaling, rounding) |
+| Krum distances and scores | integer (i32 shifts, i64 accumulation, saturating) |
+| Krum result | the selected original `f32` update |
+| Multi-Krum result | mean of selected original updates, in `f32` |
+| Median, trimmed mean, FedAvg | floating-point throughout |
 
-Reputation in Qora-FL is **not trust**. It is a deviation-derived signal measuring how closely a client's update aligns with the emergent robust consensus.
+So the determinism claim covers the scoring stage, not the end-to-end result.
+Selection *rankings* are reproducible; the returned values are `f32` and inherit
+whatever the encoding and averaging stages do.
 
-Reputation may be used to:
+## Reputation
 
-- **Weight** aggregation contributions (cubic influence: `min(rep^3, 0.8)`)
-- **Gate** participation (clients below threshold are excluded)
-- **Detect** persistent outliers across rounds (not just per-round anomalies)
-- **Persist** across server restarts via JSON serialization
+Reputation is **not trust**. It is a deviation-derived signal measuring how far
+a client's update sits from the aggregate that round.
 
-The 0.8 influence cap prevents any single node from dominating consensus, even at maximum reputation. This mitigates the "Slander-Amplification" vulnerability identified during the QRES deployment.
+**What it does today:**
+
+- **Tracks** scores across rounds, persisted via JSON serialization
+- **Gates** participation: clients below the configured threshold are excluded
+  before aggregation
+- **Fails closed**: if every identified client is below the threshold, the round
+  returns `AllUpdatesRejected` rather than reinstating them
+- **Maintains numeric invariants**: scores are finite and within `[0, 1]`, and
+  invalid mutation inputs are rejected rather than clamped
+
+**What it does not do yet:** cubic influence weighting (`min(rep^3, 0.8)`) and
+its cap are available as utilities, and a caller may use those values directly.
+The primary aggregation path does not currently consume them, so the cap does
+not provide protection for the default aggregation workflow.
+Reputation-weighted robust aggregation is roadmap work.
+
+Details that affect configuration:
+
+- Unknown clients start at the default score of 0.5. A ban threshold above 0.5
+  therefore rejects every first-round participant -- which now fails the round
+  rather than passing it through ungated.
+- Through the Flower adapter, reputation is computed from the complete
+  flattened model, and each client receives at most one update per round.
+  The adapter performs no gating of its own.
 
 ---
 
@@ -116,7 +168,29 @@ fl.server.start_server(
 )
 ```
 
-`QoraStrategy` inherits from `FedAvg` -- all standard Flower parameters (`fraction_fit`, `min_fit_clients`, `initial_parameters`, etc.) work as expected.
+`QoraStrategy` inherits from `FedAvg`, so standard Flower parameters
+(`fraction_fit`, `min_fit_clients`, `initial_parameters`, `accept_failures`,
+`fit_metrics_aggregation_fn`) are accepted. It is a **compatibility adapter**,
+not a behavioral replacement for every Flower built-in strategy.
+
+What the adapter does:
+
+- Flower is optional, installed via `qora-fl[flower]`. Supported range
+  `flwr>=1.5,<2`; CI tests 1.5.0 and 1.32.1.
+- Validates each client's complete model structure -- layer count, per-layer
+  shape, floating-point dtype, finiteness -- and rejects the round on a
+  mismatch rather than dropping the client.
+- Flattens each complete model and aggregates it in a single call, then
+  restores the original layer shapes. Aggregation happens in `float32`;
+  `float64` input is converted and its extra precision is not preserved.
+  Integer parameter arrays are rejected.
+- Weights by `num_examples` for FedAvg. Robust methods treat each accepted
+  client update as one participant.
+- Honors `accept_failures`: reported failures refuse the round when it is False.
+- Returns `{}` for metrics unless a `fit_metrics_aggregation_fn` is supplied.
+  Reputation is available through `QoraStrategy.get_reputation`.
+- Performs no gating of its own; reputation gating and updates happen once, in
+  the Rust aggregator.
 
 ## Python (Standalone)
 
@@ -168,18 +242,23 @@ cargo add qora-fl
 use qora_fl::{ByzantineAggregator, AggregationMethod};
 use ndarray::array;
 
-let mut agg = ByzantineAggregator::new(AggregationMethod::TrimmedMean, 0.3);
+let mut agg = ByzantineAggregator::new(AggregationMethod::TrimmedMean, 0.2);
 
 let updates = vec![
-    array![[1.0, 2.0]],   // Honest
-    array![[1.1, 2.1]],   // Honest
-    array![[0.9, 1.9]],   // Honest
-    array![[100.0, 200.0]], // Byzantine attacker
+    array![[1.0, 2.0]],     // Honest
+    array![[1.1, 2.1]],     // Honest
+    array![[0.9, 1.9]],     // Honest
+    array![[1.05, 2.05]],   // Honest
+    array![[100.0, 200.0]], // Byzantine
 ];
 
 let result = agg.aggregate(&updates, None).unwrap();
-// Result is close to [1.0, 2.0], attacker ignored
+// [[1.05, 2.05]] -- the outlier is trimmed away
 ```
+
+Note the client count: `trim_fraction = 0.2` removes `ceil(n * 0.2)` values from
+each end, so at least `2 * ceil(n * 0.2) + 1` updates must be supplied or the
+call returns `InsufficientQuorum`.
 
 ### Individual Functions
 
@@ -194,41 +273,82 @@ let med = median(&updates).unwrap();
 let avg = fedavg(&updates, None).unwrap();
 ```
 
-## Aggregation Methods
+## Aggregation methods and their assumptions
 
-| Method | Byzantine Tolerance | Use Case |
-|--------|-------------------|----------|
-| `TrimmedMean` | ~30% of clients | Default choice for most FL deployments |
-| `Median` | ~50% of clients | When stronger robustness is needed |
-| `Krum` | n >= 2f+3 | Deterministic single-vector selection |
-| `MultiKrum` | n >= 2f+3, 1 <= m <= n-2f-2 | Top-m averaging for smoother convergence |
-| `FedAvg` | None | Baseline comparison only |
+`n` is the number of accepted client updates; `f` is the configured Byzantine
+bound; `m` is the number of Multi-Krum candidates selected.
 
-## Benchmarks
+| Method | Enforced precondition | Assumption for robustness |
+|---|---|---|
+| `TrimmedMean` | `0.0 <= trim_fraction <= 0.5`, and at least one value must survive trimming | Depends on trim fraction, adversarial proportion, attack model, and the distribution of honest updates |
+| `Median` | none beyond shared input validation | Strictly fewer than 50% adversarial values **per coordinate** |
+| `Krum` | `n >= 2f + 3` | Blanchard et al. (2017) |
+| `MultiKrum` | `n >= 2f + 3` and `1 <= m <= n - 2f - 2` | Blanchard et al. (2017) |
+| `FedAvg` | weights, when supplied, must be finite and non-negative with a positive total | **None.** Conventional sample-weighted baseline; provides no Byzantine robustness by itself |
 
-Trimmed mean remains stable under ~30% label-flipping and gradient-scaling attacks, converging faster and to higher accuracy than undefended FedAvg. Aggregation overhead stays under 10ms for typical FL model sizes. At larger model sizes, aggregation cost becomes memory-bound, consistent with the behavior of coordinate-wise robust aggregation methods.
+**Trimmed mean** removes the configured fraction of the smallest and largest
+values independently in each coordinate. A trim fraction is *not* an attacker
+percentage: `trim_fraction = 0.2` does not establish tolerance of 30% malicious
+clients, and no such universal guarantee is claimed here.
 
-### Byzantine Robustness
+**Median** requires an honest majority per coordinate. Exactly 50% adversarial
+is not strictly fewer than half, so "tolerates 50%" would be wrong.
 
-The following benchmark evaluates all aggregation methods against five common FL attacks (Label Flip, Gradient Scaling, Sign Flip, Additive Noise, ALIE) with 10–30% Byzantine clients:
+**Krum** rejects configurations violating `n >= 2f + 3` with
+`InsufficientQuorum`. There is no best-effort path below quorum.
 
-<p align="center">
-  <img src="docs/images/attack_evaluation.png" alt="Test accuracy vs Byzantine percentage across five attack types. FedAvg collapses under Gradient Scaling and Additive Noise attacks, while Trimmed Mean, Median, Krum, and Multi-Krum maintain 90%+ accuracy even at 30% Byzantine clients." width="100%">
-</p>
+**Multi-Krum** rejects an explicit `m` outside `1..=n - 2f - 2` with
+`InvalidMultiKrumSelection`. When `m` is omitted, Qora-FL uses
+`min(3, n - 2f - 2)`; explicit unsafe values are rejected rather than silently
+reduced.
 
-**Key finding:** FedAvg drops to ~10% accuracy under gradient-based attacks. Robust aggregators maintain >90% accuracy across all attack types and Byzantine ratios.
+## Experiments
 
-### Convergence Under Attack
+Qora-FL includes an attack-evaluation script for comparing aggregation methods
+across selected attacks and adversarial-client fractions. **The repository does
+not currently publish verified benchmark results** from a pinned dataset
+artifact and repeated multi-seed evaluation. Run the included experiment to
+evaluate the methods in your own environment.
 
-Under a sustained 30% label-flipping attack, robust methods converge faster and reach higher final accuracy:
+The script is [`examples/attack_evaluation.py`](examples/attack_evaluation.py).
+Its configuration:
 
-<p align="center">
-  <img src="docs/images/mnist_poisoning_comparison.png" alt="Test accuracy over 5 federated rounds with 30% label-flipping attackers. Trimmed Mean, Median, and Krum converge to 91-92% accuracy while FedAvg lags at lower accuracy throughout training." width="700">
-</p>
+| | |
+|---|---|
+| Dataset | MNIST via OpenML, falling back to scikit-learn `load_digits` if unavailable |
+| Model | 2-layer MLP, hidden size 128 |
+| Clients | 10 |
+| Rounds | 15 |
+| Local epochs | 1 |
+| Learning rate | 0.1 |
+| Adversarial fractions | 10%, 20%, 30% |
+| Attacks | label flip, gradient scaling, sign flip, additive noise, ALIE |
+| Methods | FedAvg, trimmed mean, median, Krum, Multi-Krum |
+| Seed | 42 |
+| Repetitions | 1 per configuration |
 
-**Key finding:** Robust aggregation methods not only tolerate attacks—they accelerate convergence by filtering noisy gradients.
+Two limitations to be aware of when interpreting a run:
 
-### Run Benchmarks
+- **The dataset can change silently.** Which of the two datasets is used depends
+  on whether the OpenML fetch succeeds at run time, so two runs on different
+  machines may not be comparing the same thing.
+- **One run per configuration.** A single seed gives no variance estimate, so
+  differences between methods cannot be separated from run-to-run noise.
+
+Publishing results would require pinning the dataset (or recording its
+checksum) so substitution cannot happen silently, running multiple seeds,
+saving machine-readable results, generating tables and plots from those saved
+results, and recording the environment and commit hash. That is separate work
+from this documentation pass.
+
+### Aggregation overhead
+
+Criterion benchmarks in [`benches/aggregation.rs`](benches/aggregation.rs) cover
+10/50/100 clients at 1K/100K/1M parameters. Run them with `cargo bench` to
+produce numbers for your own hardware; timings are machine-specific and are not
+reproduced here as project claims.
+
+### Reproducing
 
 ```bash
 # Aggregation overhead (Python)
@@ -248,27 +368,54 @@ cargo run --example quickstart
 cargo run --example compare_methods
 ```
 
+## Validation status
+
+Qora-FL is currently validated through:
+
+- the Rust unit and integration test suite
+- Python binding and Flower adapter tests
+- cross-platform Rust CI (Linux, macOS, Windows) and Python CI
+- Flower compatibility tests at both ends of the supported version range
+- algorithm preconditions enforced in code and covered by tests
+- the included examples and benchmarks, under their documented configurations
+
+This is engineering validation. It is **not** an independent security review,
+and it does not establish robustness outside each algorithm's stated
+assumptions. See [SECURITY.md](SECURITY.md) for the boundaries.
+
 ## Background
 
-The aggregation algorithms in Qora-FL (trimmed mean, coordinate-wise median, Krum, Multi-Krum) are standard Byzantine-robust aggregation methods from the federated learning literature [1][2]. The specific design decisions -- deviation-derived reputation, BFP-16 deterministic paths, adaptive trim fraction, and the 0.8 influence cap -- were informed by operational experience during a 181-day autonomous IoT deployment ([QRES](https://github.com/CavinKrenik/RaaS)). The Qora-FL codebase is a clean-room Rust implementation; it does not share code with the original QRES prototype.
+The aggregation algorithms in Qora-FL (trimmed mean, coordinate-wise median,
+Krum, Multi-Krum) are standard Byzantine-robust methods from the federated
+learning literature [1][2].
 
-## Design Philosophy
+## Project history
 
-Qora-FL treats aggregation as a **decision process**, not a statistical convenience. The system favors explicit constraints, observable signals, and predictable failure modes over opaque optimization.
+Qora-FL grew out of aggregation and distributed-trust experiments explored in
+the earlier QRES project ([CavinKrenik/QRES_RaaS](https://github.com/CavinKrenik/QRES_RaaS),
+historical work). Design choices here -- deviation-derived reputation, the
+BFP-16 scoring path, adaptive trim fraction, and the influence cap -- were
+informed by those earlier experiments and long-horizon simulations.
+
+Qora-FL is a separate implementation with its own tests, experiments, and
+assumptions. Results or guarantees from QRES do not automatically apply to
+Qora-FL, and none of the evidence in this repository is inherited from it.
 
 ## Roadmap
 
-- Weighted robust aggregation (reputation-scaled trimmed mean)
+- Reputation-weighted robust aggregation
+- Norm-bound verification as an opt-in pre-aggregation filter
 - TensorFlow Federated adapter
-- Formal verification experiments for the deterministic path
-- Norm-bound verification as a pre-aggregation filter
+- Formal verification experiments for the integer scoring path
 
 ## Requirements
 
 - **Rust:** edition 2021, stable toolchain
 - **Python:** >= 3.8 (bindings built with PyO3 abi3)
 - **NumPy:** >= 1.21.0
-- **Flower** (optional): >= 1.5.0 (`pip install qora-fl[flower]`)
+- **Flower** (optional): `>=1.5,<2` (`pip install qora-fl[flower]`). Tested in
+  CI at 1.5.0 and 1.32.1. `import qora` works without it; only
+  `qora.QoraStrategy` requires it.
 
 ### Building from Source
 
@@ -288,7 +435,7 @@ maturin develop --features python
 
 1. Blanchard, P., El Mhamdi, E. M., Guerraoui, R., & Stainer, J. (2017). Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent. *NeurIPS*.
 2. Yin, D., Chen, Y., Ramchandran, K., & Bartlett, P. (2018). Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates. *ICML*.
-3. Krenik, C. (2025). QRES: Resource-Aware Agentic Swarm for Distributed Learning. *Zenodo*. [DOI: 10.5281/zenodo.18474976](https://doi.org/10.5281/zenodo.18474976)
+3. Krenik, C. (2025). QRES: Resource-Aware Agentic Swarm for Distributed Learning. *Zenodo*. [DOI: 10.5281/zenodo.18474976](https://doi.org/10.5281/zenodo.18474976) -- earlier project, cited as lineage rather than as evidence for Qora-FL.
 
 ## License
 

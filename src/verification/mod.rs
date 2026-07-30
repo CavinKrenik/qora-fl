@@ -1,10 +1,20 @@
 //! Verification primitives for federated learning updates.
 //!
-//! Provides practical verification checks for model updates:
+//! Provides verification primitives for model updates:
 //!
-//! - [`norm_bound`] — Reject updates with excessive L2 norm
-//! - [`krum_condition`] — Check Krum's `n >= 2f+3` requirement
-//! - [`audit`] — Append-only aggregation audit log
+//! - [`krum_condition`] — Krum's `n >= 2f+3` requirement and the Multi-Krum
+//!   selection bound. **Wired into aggregation** and enforced.
+//! - [`norm_bound`] — L2 norm checking. [`norm_bound::check_norm_bound`] is the
+//!   checked API: it validates finiteness and the bound itself, and computes
+//!   the norm in `f64`. It is **not** invoked by any aggregation path;
+//!   integrating it is roadmap work.
+//!   [`norm_bound::filter_by_norm_bound`] is deprecated because it discards
+//!   verification errors silently.
+//! - [`audit`] — Append-only aggregation audit log. **Caller-owned and
+//!   experimental**; nothing in the aggregation path writes to it.
+//!
+//! See `docs/VERIFICATION_INTEGRATION.md` for the policy governing the
+//! unintegrated pieces.
 
 pub mod audit;
 pub mod krum_condition;

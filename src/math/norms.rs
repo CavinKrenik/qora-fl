@@ -34,6 +34,33 @@ pub(crate) fn l2_norm_f64(v: &[f32]) -> f64 {
         .sqrt()
 }
 
+/// L2 distance between two `f32` sequences, computed entirely in `f64`.
+///
+/// Each pair is widened to `f64` **before** subtracting. Computing the
+/// differences in `f32` first and widening afterwards would be unsound: the
+/// subtraction itself can overflow to infinity for large finite operands, and
+/// the square can underflow to zero for close ones, so the damage would
+/// already be done before any `f64` arithmetic saw the values. For the same
+/// reason this cannot be expressed as [`l2_norm_f64`] over a precomputed
+/// difference array.
+///
+/// Iterates the shorter sequence if lengths differ; callers are expected to
+/// have validated shapes already.
+pub(crate) fn l2_distance_f64<'a, A, B>(a: A, b: B) -> f64
+where
+    A: IntoIterator<Item = &'a f32>,
+    B: IntoIterator<Item = &'a f32>,
+{
+    a.into_iter()
+        .zip(b)
+        .map(|(&x, &y)| {
+            let difference = f64::from(x) - f64::from(y);
+            difference * difference
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
 /// Compute the squared L2 norm of an f32 slice (avoids sqrt).
 ///
 /// # Range limitation
@@ -77,5 +104,97 @@ mod tests {
     #[test]
     fn test_l2_norm_single() {
         assert!((l2_norm(&[-7.0f32]) - 7.0).abs() < 1e-6);
+    }
+
+    // --- l2_distance_f64 ---
+
+    #[test]
+    fn test_distance_matches_hand_computation() {
+        let a = [3.0f32, 0.0];
+        let b = [0.0f32, 4.0];
+        assert!((l2_distance_f64(a.iter(), b.iter()) - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_identical_vectors_give_exactly_zero() {
+        let v = [1.5f32, -2.5, 1e20, 1e-25];
+        assert_eq!(l2_distance_f64(v.iter(), v.iter()), 0.0);
+    }
+
+    /// Large finite operands must not overflow.
+    ///
+    /// The difference here is 2e20 and its square 4e40, well past `f32::MAX`
+    /// (~3.4e38). Subtracting in `f32` would produce `inf` before any `f64`
+    /// arithmetic could see the values, which is why the operands are widened
+    /// first rather than the result being cast afterwards.
+    #[test]
+    fn test_large_finite_operands_do_not_overflow() {
+        let a = [1e20f32, 1e20];
+        let b = [-1e20f32, -1e20];
+
+        let distance = l2_distance_f64(a.iter(), b.iter());
+
+        assert!(distance.is_finite(), "distance overflowed: {}", distance);
+        // 2e20 * sqrt(2) ~= 2.828e20
+        assert!(
+            (distance / 2.828427e20 - 1.0).abs() < 1e-5,
+            "got {}",
+            distance
+        );
+
+        // The f32 route this replaced, shown failing for the record.
+        let f32_route: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            f32_route.is_infinite(),
+            "f32 accumulation should overflow here; if it no longer does, this \
+             test no longer pins anything"
+        );
+    }
+
+    /// Tiny finite differences must not underflow to a zero distance.
+    ///
+    /// `(1e-25)^2` is 1e-50, below the smallest `f32` subnormal (~1.4e-45), so
+    /// squaring in `f32` flushes every term to zero and reports two distinct
+    /// vectors as identical.
+    #[test]
+    fn test_tiny_finite_differences_do_not_underflow() {
+        let a = [1e-25f32, 1e-25];
+        let b = [0.0f32, 0.0];
+
+        let distance = l2_distance_f64(a.iter(), b.iter());
+
+        assert!(distance > 0.0, "distance underflowed to {}", distance);
+        assert!(
+            (distance / 1.414214e-25 - 1.0).abs() < 1e-5,
+            "got {}",
+            distance
+        );
+
+        let f32_route: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f32>()
+            .sqrt();
+        assert_eq!(
+            f32_route, 0.0,
+            "f32 accumulation should underflow here; if it no longer does, \
+             this test no longer pins anything"
+        );
+    }
+
+    #[test]
+    fn test_distance_is_symmetric() {
+        let a = [1.0f32, -3.0, 1e18];
+        let b = [2.0f32, 5.0, -1e18];
+        assert_eq!(
+            l2_distance_f64(a.iter(), b.iter()),
+            l2_distance_f64(b.iter(), a.iter())
+        );
     }
 }

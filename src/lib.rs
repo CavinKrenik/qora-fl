@@ -158,12 +158,17 @@ mod python {
             adaptive_trim: bool,
         ) -> PyResult<Self> {
             let agg_method = parse_method(&method)?;
+            // `> 0.0` is false for NaN, so an invalid threshold would take the
+            // ungated branch and never be checked. Validate it first.
+            crate::reputation::validate::validate_threshold(ban_threshold).map_err(qora_err)?;
+
             let mut inner = if ban_threshold > 0.0 {
                 crate::ByzantineAggregator::with_ban_threshold(
                     agg_method,
                     trim_fraction,
                     ban_threshold,
                 )
+                .map_err(qora_err)?
             } else {
                 crate::ByzantineAggregator::new(agg_method, trim_fraction)
             };
@@ -214,10 +219,14 @@ mod python {
         /// Call once per round to allow penalized clients to recover.
         ///
         /// Args:
-        ///     rate: Decay rate in (0.0, 1.0). Typical: 0.01-0.05.
+        ///     rate: Decay rate in [0.0, 1.0]. Typical: 0.01-0.05.
+        ///
+        /// Raises:
+        ///     ValueError: If rate is not finite and within [0.0, 1.0].
+        ///         No score changes when the rate is rejected.
         #[pyo3(signature = (rate=0.02))]
-        fn decay_reputations(&mut self, rate: f32) {
-            self.inner.decay_reputations(rate);
+        fn decay_reputations(&mut self, rate: f32) -> PyResult<()> {
+            self.inner.decay_reputations(rate).map_err(qora_err)
         }
 
         /// Serialize aggregator state to JSON for persistence.
@@ -250,11 +259,12 @@ mod python {
     impl PyReputationManager {
         #[new]
         #[pyo3(signature = (ban_threshold=0.2))]
-        fn new(ban_threshold: f32) -> Self {
-            Self {
+        fn new(ban_threshold: f32) -> PyResult<Self> {
+            crate::reputation::validate::validate_threshold(ban_threshold).map_err(qora_err)?;
+            Ok(Self {
                 inner: ReputationStore::new(),
                 ban_threshold,
-            }
+            })
         }
 
         /// Get the trust score for a client (default 0.5 for unknown).
@@ -262,19 +272,32 @@ mod python {
             self.inner.get_score(client_id)
         }
 
-        /// Set the trust score for a client (clamped to [0.0, 1.0]).
-        fn set_score(&mut self, client_id: String, score: f32) {
-            self.inner.set_score(client_id, score);
+        /// Set the trust score for a client.
+        ///
+        /// Raises:
+        ///     ValueError: If score is not finite and within [0.0, 1.0].
+        ///         Out-of-range scores are rejected rather than clamped, and
+        ///         the existing score is left unchanged.
+        fn set_score(&mut self, client_id: String, score: f32) -> PyResult<()> {
+            self.inner.set_score(client_id, score).map_err(qora_err)
         }
 
         /// Increase a client's reputation by the given amount.
-        fn reward(&mut self, client_id: String, amount: f32) {
-            self.inner.reward(client_id, amount);
+        ///
+        /// Raises:
+        ///     ValueError: If amount is not finite and non-negative. Large
+        ///         amounts are accepted and saturate at 1.0.
+        fn reward(&mut self, client_id: String, amount: f32) -> PyResult<()> {
+            self.inner.reward(client_id, amount).map_err(qora_err)
         }
 
         /// Decrease a client's reputation by the given amount.
-        fn penalize(&mut self, client_id: String, amount: f32) {
-            self.inner.penalize(client_id, amount);
+        ///
+        /// Raises:
+        ///     ValueError: If amount is not finite and non-negative. Large
+        ///         amounts are accepted and saturate at 0.0.
+        fn penalize(&mut self, client_id: String, amount: f32) -> PyResult<()> {
+            self.inner.penalize(client_id, amount).map_err(qora_err)
         }
 
         /// Check if a client is banned (score below ban threshold).
@@ -304,10 +327,14 @@ mod python {
         /// Decay all reputation scores toward 0.5 (default).
         ///
         /// Args:
-        ///     rate: Decay rate in (0.0, 1.0). Typical: 0.01-0.05.
+        ///     rate: Decay rate in [0.0, 1.0]. Typical: 0.01-0.05.
+        ///
+        /// Raises:
+        ///     ValueError: If rate is not finite and within [0.0, 1.0].
+        ///         No score changes when the rate is rejected.
         #[pyo3(signature = (rate=0.02))]
-        fn decay(&mut self, rate: f32) {
-            self.inner.decay_toward_default(rate);
+        fn decay(&mut self, rate: f32) -> PyResult<()> {
+            self.inner.decay_toward_default(rate).map_err(qora_err)
         }
 
         /// Compute the influence weight for a client: min(rep^3, 0.8).
@@ -324,6 +351,9 @@ mod python {
         #[staticmethod]
         #[pyo3(signature = (json_str, ban_threshold=0.2))]
         fn from_json(json_str: &str, ban_threshold: f32) -> PyResult<Self> {
+            crate::reputation::validate::validate_threshold(ban_threshold).map_err(qora_err)?;
+            // Score validation happens inside ReputationStore's Deserialize
+            // impl, so a persisted file cannot reintroduce a rejected score.
             let inner: ReputationStore<String> =
                 serde_json::from_str(json_str).map_err(json_err)?;
             Ok(Self {

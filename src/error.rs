@@ -112,6 +112,65 @@ pub enum QoraError {
         threshold: f32,
     },
 
+    /// A reputation score is outside the storable range
+    ///
+    /// Every stored score must be finite and within `[0.0, 1.0]`. An explicit
+    /// out-of-range score is rejected rather than clamped: a caller passing
+    /// `5.0` has most likely misunderstood the scale, and silently storing
+    /// `1.0` would conceal that.
+    #[error("invalid reputation score {value}; expected a finite value in [0, 1]")]
+    InvalidReputationScore {
+        /// The rejected score
+        value: f32,
+    },
+
+    /// A reward or penalty amount is not a usable adjustment
+    ///
+    /// Amounts must be finite and non-negative. A negative amount inverts the
+    /// operation -- a "reward" of `-5.0` used to drive a score to `-4.5`,
+    /// escaping the `[0, 1]` invariant entirely. Large finite amounts are
+    /// permitted and saturate at the boundary.
+    #[error("invalid reputation adjustment {value}; expected a finite non-negative value")]
+    InvalidReputationAdjustment {
+        /// The rejected amount
+        value: f32,
+    },
+
+    /// A decay factor is outside `[0.0, 1.0]`
+    ///
+    /// `0.0` leaves scores untouched and `1.0` moves them fully to the
+    /// default; values outside that range extrapolate away from it. A NaN
+    /// factor previously turned *every* stored score into NaN in a single
+    /// call.
+    #[error("invalid reputation decay factor {value}; expected a finite value in [0, 1]")]
+    InvalidReputationDecay {
+        /// The rejected factor
+        value: f32,
+    },
+
+    /// A ban threshold is outside `[0.0, 1.0]`
+    ///
+    /// A threshold above the 0.5 default score is valid and deliberately
+    /// rejects unknown clients; a non-finite or out-of-range one is not.
+    #[error("invalid reputation threshold {value}; expected a finite value in [0, 1]")]
+    InvalidReputationThreshold {
+        /// The rejected threshold
+        value: f32,
+    },
+
+    /// A computed reputation distance is not finite
+    ///
+    /// Validated updates are finite and the distance is accumulated in `f64`,
+    /// so this should be unreachable. It is reported rather than silently
+    /// treated as zero distance, which would read as maximum trust.
+    #[error("non-finite reputation distance {value} for client {client_id}")]
+    NonFiniteReputationDistance {
+        /// The client whose update produced it
+        client_id: String,
+        /// The offending distance
+        value: f64,
+    },
+
     /// Error in reputation tracking
     #[error("Reputation error: {0}")]
     ReputationError(String),

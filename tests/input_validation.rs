@@ -257,7 +257,8 @@ fn bfp16_encoding_still_launders_non_finite_input() {
 /// inside the ban-threshold filter -- a panic across the PyO3 boundary too.
 #[test]
 fn aggregator_rejects_too_many_client_ids() {
-    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::Median, 0.0, 0.2);
+    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::Median, 0.0, 0.2)
+        .expect("test threshold is valid");
     let updates = vec![array![[1.0]], array![[2.0]], array![[3.0]]];
     let ids: Vec<String> = (0..6).map(|i| format!("c{}", i)).collect();
 
@@ -296,7 +297,8 @@ fn aggregate_rejects_mismatched_client_ids() {
 
     for ban_threshold in [0.0, 0.2] {
         let mut agg =
-            ByzantineAggregator::with_ban_threshold(AggregationMethod::Median, 0.0, ban_threshold);
+            ByzantineAggregator::with_ban_threshold(AggregationMethod::Median, 0.0, ban_threshold)
+                .expect("test threshold is valid");
         let ids = vec!["a".to_string(), "b".to_string()];
         assert!(
             agg.aggregate(&updates, Some(&ids)).is_err(),
@@ -440,7 +442,8 @@ fn krum_min_clients_saturates_on_absurd_f() {
 /// closes that hole.
 #[test]
 fn nan_update_does_not_enter_reputation_tracking() {
-    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::TrimmedMean, 0.2, 0.2);
+    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::TrimmedMean, 0.2, 0.2)
+        .expect("test threshold is valid");
 
     let updates = vec![
         array![[1.0]],

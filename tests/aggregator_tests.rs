@@ -736,7 +736,8 @@ fn test_reputation_decay_toward_default() {
 
     // Apply decay toward 0.5
     for _ in 0..10 {
-        agg.decay_reputations(0.1);
+        agg.decay_reputations(0.1)
+            .expect("valid reputation operation");
     }
 
     let after_decay = agg.get_reputation("attacker");
@@ -781,7 +782,8 @@ fn test_reputation_decay_high_score() {
     assert!(before > 0.5, "Good client should have high rep: {}", before);
 
     for _ in 0..20 {
-        agg.decay_reputations(0.1);
+        agg.decay_reputations(0.1)
+            .expect("valid reputation operation");
     }
 
     let after = agg.get_reputation("good");
@@ -797,7 +799,8 @@ fn test_reputation_decay_high_score() {
 fn test_ban_gating_excludes_bad_clients() {
     // Use trimmed_mean to build accurate reputations (robust against attacker).
     // Then verify that ban gating actually excludes low-reputation clients.
-    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::TrimmedMean, 0.2, 0.3);
+    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::TrimmedMean, 0.2, 0.3)
+        .expect("test threshold is valid");
 
     let updates = vec![
         array![[1.0]],
@@ -846,7 +849,8 @@ fn test_ban_gating_excludes_bad_clients() {
 /// reinstated, so the gate did nothing precisely when reputation distrusted
 /// the entire cohort. Gating now fails closed.
 fn test_ban_gating_fails_closed_when_all_banned() {
-    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::FedAvg, 0.0, 0.99);
+    let mut agg = ByzantineAggregator::with_ban_threshold(AggregationMethod::FedAvg, 0.0, 0.99)
+        .expect("test threshold is valid");
 
     // Unknown clients default to 0.5, so nobody clears a 0.99 threshold.
     let updates = vec![array![[1.0]], array![[2.0]], array![[3.0]]];
@@ -886,7 +890,9 @@ fn test_reputation_tracker_decay() {
 
     // Decay back toward 0.5
     for _ in 0..50 {
-        tracker.decay_toward_default(0.1);
+        tracker
+            .decay_toward_default(0.1)
+            .expect("valid reputation operation");
     }
     assert!(
         (tracker.get_score(&peer) - 0.5).abs() < 0.01,
@@ -916,7 +922,9 @@ fn test_reputation_tracker_prune() {
     // peer2 has no activity but gets a tiny bump then decays back
     tracker.reward_valid_zkp(&peer2);
     for _ in 0..50 {
-        tracker.decay_toward_default(0.1);
+        tracker
+            .decay_toward_default(0.1)
+            .expect("valid reputation operation");
     }
 
     // peer2 should be near default, peer1 also near default after decay

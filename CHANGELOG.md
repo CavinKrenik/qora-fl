@@ -4,159 +4,217 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-Input validation and numeric hardening. Every item below is a
-correctness/security fix: in each case the documented contract or the intended
-invariant already existed and the implementation contradicted it.
+## [0.4.0] - 2026-08-02
 
-Targeting **0.4.0**, not 0.3.2 — several changes are observable to callers, and
-under `^0.3` a patch release would reach them automatically rather than
-prompting a review. Version metadata in `Cargo.toml` and
-`bindings/python/pyproject.toml` deliberately **remains at `0.3.1`** until the
-release is actually cut; the API migrations recorded below take effect in
-0.4.0.
+A correctness and hardening release. Every fix below closes a gap where the
+documented contract or the intended invariant already existed and the
+implementation contradicted it; the two new features — optional norm-bound
+filtering and caller-owned audit records — are both opt-in and change nothing
+for callers who do not configure them.
 
-### Documentation
+**0.4.0, not 0.3.2.** Several changes are observable to callers: calls that
+returned a value now return a `Result`, and paths that returned a plausible
+answer under violated preconditions now refuse the round. Under `^0.3` a patch
+release would reach existing users automatically rather than prompting a
+review.
 
-No behavior changed in this set; every item aligns a public claim with evidence
-that exists in this repository.
+**Upgrading: see [docs/MIGRATING_TO_0.4.md](docs/MIGRATING_TO_0.4.md)**, which
+covers every breaking change with before/after guidance.
 
-- Clarified the assumptions and enforced preconditions for trimmed mean,
-  median, Krum, and Multi-Krum. A trim fraction is no longer presented as an
-  attacker percentage, and median is stated as requiring *strictly fewer than*
-  50% adversarial values per coordinate rather than tolerating 50%.
-- Narrowed determinism claims to integer Krum scoring after BFP-16 encoding.
-  The previous "deterministic aggregation paths" and "bit-perfect agreement"
-  wording covered a pipeline that begins with floating-point encoding and ends
-  with `f32` results.
-- Documented the Flower adapter's sample weighting, model validation, failure
-  policy, metrics behavior, and optional-dependency status, including the
-  supported and CI-tested Flower versions.
-- Clarified that reputation currently provides tracking and participation
-  gating. Cubic influence weighting exists as a utility and is not consumed by
-  any aggregation path; it is listed as roadmap work rather than a feature.
-- Reframed QRES as project history rather than validation evidence. The
-  181-day deployment, ESP32 hardware, and "Slander-Amplification" references
-  no longer appear as support for claims about Qora-FL, whose evidence is its
-  own tests and experiments.
-- Corrected the QRES repository link, which pointed at a 404
-  (`CavinKrenik/RaaS` → `CavinKrenik/QRES_RaaS`).
-- Added explicit experimental status, a "currently implemented" versus
-  "experimental or planned" split, and a validation-status section noting the
-  absence of an independent security review.
-- Rewrote `SECURITY.md` to separate what the project enforces from what it does
-  not provide, and to replace the single project-wide "30% Byzantine" threat
-  model with per-method assumptions.
-- Removed the published benchmark figures and their directional conclusions.
-  The evaluation script and its full configuration remain documented, along
-  with the two properties that stop a run from being reproducible evidence: the
-  dataset can be substituted silently when the OpenML fetch fails, and each
-  configuration runs once, giving no variance estimate. Publishing results again
-  requires a pinned dataset, multiple seeds, and saved machine-readable output.
-- Documented `verification::norm_bound` and `verification::audit` as
-  unintegrated and experimental. Superseded later in this same cycle:
-  `norm_bound` is now the shared primitive behind the opt-in aggregation filter,
-  and the legacy `verification::audit` types are deprecated in favour of the
-  root-level schema. The READMEs, `docs/TUNING.md`, and
-  `docs/VERIFICATION_INTEGRATION.md` describe the shipped behavior.
-- Fixed a non-working Rust example in the README: `trim_fraction = 0.3` with
-  four clients trims every value and returns `InsufficientQuorum`.
+### Added
+- **Optional norm-bound filtering on `ByzantineAggregator`.** Filtering is
+  **disabled by default** and excludes updates whose finite `f64` L2 norm
+  exceeds a configured positive bound.
 
-### Fixed
+  Configured with `with_norm_bound_filter(bound) -> Result<Self, QoraError>`,
+  cleared with `without_norm_bound_filter()`, read back with `norm_bound()`. In
+  Python: `ByzantineAggregator(method, trim_fraction, norm_bound=...)` and
+  `QoraStrategy(..., norm_bound=...)`, where `None` is disabled. A bound must be
+  finite and strictly positive; zero, negative, NaN, and infinite bounds return
+  `QoraError::InvalidNormBound` (Python `ValueError`) rather than being clamped,
+  and the same validation runs on deserialization.
 
-- **The Flower adapter aggregated and updated reputation per layer instead of
-  once per complete client model.** Each layer was passed to the aggregator in
-  a separate call, so a selection method could choose a *different client for
-  each layer* and return a model no client submitted. Reputation was computed
-  from the first layer only, which let a client match the cohort on layer 0 and
-  deviate arbitrarily on every later layer without penalty. Complete models are
-  now flattened into one update, aggregated in a single call, and split back
-  into their original layer shapes.
-- **Flower is now installed in Python CI**, so `QoraStrategy` is imported and
-  exercised against real `FitRes`, `Status`, and `Parameters` types. The
-  adapter previously had no CI coverage at all -- the job never installed
-  Flower, so the import could not even be attempted.
+  With no bound configured, no norm is computed and behavior is exactly as
+  before. With one configured:
 
-- **Multi-Krum now enforces its documented selection bound
-  `1 <= m <= n - 2f - 2`** (Blanchard et al., 2017). `aggregate_multi_krum_bfp16`
-  previously clamped with `m.max(1).min(n)`, so an oversized `m` returned a
-  normal-looking selection that carried no Byzantine guarantee -- the same
-  failure mode as the single-Krum "best-effort" path removed earlier in this
-  cycle. The low-level function now returns `None`; `ByzantineAggregator`
-  reports the new `QoraError::InvalidMultiKrumSelection`.
+  - The norm is computed in `f64` and compared inclusively -- a norm exactly
+    equal to the bound participates, matching `check_norm_bound`, which now
+    shares the comparison through the internal `evaluate_norm_bound`.
+  - A rejected update's client ID and FedAvg sample weight are removed with it,
+    so a rejected weight cannot reach the numerator or the denominator or attach
+    to another client.
+  - **A rejected update does not affect reputation** -- no reward, no penalty,
+    no ban, and its stored score does not move however many rounds it is
+    excluded for. A norm bound is a participation filter, not a reputation
+    policy; a large norm is a policy violation rather than proof of malicious
+    intent, and this filter does not claim to detect Byzantine behavior. (This
+    reverses the tentative position in
+    `docs/VERIFICATION_INTEGRATION.md` §7, which is amended in place.)
+  - Reputation gating runs first, and a client it removes is not measured again,
+    so every submitted update carries at most one rejection reason.
+  - Malformed input still outranks filtering: empty batches, dimension
+    mismatches, non-finite values or weights, and client-ID count mismatches are
+    errors, never filtering decisions.
+  - If nothing survives, the round fails closed with
+    `QoraError::AllUpdatesRejected`.
 
-  This matters most after reputation gating, where the effective `n` shrinks
-  between rounds and a fixed `m` can silently drift out of range.
-- Norm-bound verification now computes L2 norms with `f64` accumulation,
-  preventing finite large updates from overflowing to infinity and very small
-  updates from underflowing to zero.
-- `check_norm_bound` now rejects non-finite update coordinates with
-  `QoraError::NonFiniteValue`.
-- Zero, negative, NaN, and infinite norm bounds now return
-  `QoraError::InvalidNormBound`.
-- Norm-bound rejection messages now report the finite computed norm using
-  scientific notation.
+  `verification::filter_by_norm_bound` remains deprecated and is **not** used by
+  the integration: it discards errors silently and cannot report per-update
+  reasons.
 
-### Deprecated
+- **Audited aggregation.** `ByzantineAggregator::aggregate_with_audit` and
+  `aggregate_weighted_with_audit` return an `AuditedAggregation` -- the
+  aggregate plus a caller-owned `AggregationAuditEntry` -- or an
+  `AuditedAggregationError`.
 
-- Deprecated `verification::audit::AggregationAuditEntry` in favor of the new
-  root-level `AggregationAuditEntry` schema. The two are different types that
-  happen to share a name, and **their serialized shapes are not compatible**:
-  the legacy record holds `round`, `n_clients`, `n_excluded`, a free-form
-  `method` string, and `trim_fraction`, while the new one holds a schema
-  version, the full `AggregationMethod`, a per-update decision list, and an
-  outcome. Stored legacy records cannot be read as the new type; there is no
-  automatic migration.
-- Deprecated `verification::audit::AuditLog`. Audit persistence is now
-  caller-owned and **no replacement storage implementation is provided** --
-  serialize `AggregationAuditEntry` and store the records with whatever the
-  application already uses.
+  The error type exists because `Result<_, QoraError>` would discard the record
+  in exactly the round it matters most: `AuditedAggregationError::audit()`
+  carries the per-update reasons through an all-rejected failure. It exposes
+  `source_error()`, `audit()`, and `into_parts()`, and converts into
+  `QoraError`.
 
-  Neither type is removed, so 0.3 callers keep compiling; both will be removed
-  in a future breaking release. The `verification::` re-export carries a
-  statement-scoped `#[allow(deprecated)]` so the re-export itself does not warn
-  while callers reaching the types through it still do.
-- `filter_by_norm_bound` is deprecated because it silently discards
-  verification errors. Callers should use `check_norm_bound` and handle each
-  result explicitly.
+  Records are handed to the caller and not retained. Nothing is persisted or
+  logged, no entry is stored inside the aggregator, and the serialized
+  aggregator does not grow with the round count.
 
-### Security
+  Which failures carry a record: an all-rejected round does; input validation,
+  invalid configuration, a method-precondition failure after some candidates
+  survived, and a post-aggregation reputation failure do not. Schema version 1
+  has two outcomes -- aggregated, and all updates rejected -- and a round where
+  some candidates survived but Krum refused the reduced cohort is neither.
+  Rather than attach a record describing something that did not happen, the
+  typed error is returned alone. A future schema version may add a failure
+  outcome.
 
-- **Non-finite values in client updates are now rejected** instead of silently
-  corrupting the aggregate. New `QoraError::NonFiniteValue { update_index, row,
-  col, value }`, enforced by `validation::validate_updates` and
-  called from `ByzantineAggregator::aggregate` as well as from `trimmed_mean`,
-  `median`, and `fedavg` directly, so the guarantee does not depend on which
-  entry point a caller uses.
+  A record from an all-rejected round reports **no effective method
+  parameters**: nothing executed, so `effective_trim_fraction` and `effective_m`
+  are `None` rather than values that were never applied.
 
-  All five methods previously accepted non-finite input without error, each
-  failing differently: the coordinate-wise methods became order-dependent (a
-  NaN's effect varied with which client submitted it), `fedavg` propagated it to
-  every output coordinate, and `krum` / `multi_krum` could not observe it at all
-  because BFP-16 encoding quantizes NaN to a zero mantissa -- which could make a
-  poisoned vector score as *closer* to the honest cluster than a genuine
-  outlier. Measured pre-fix behavior for each method is recorded in
-  [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md).
+- `QoraError::NormBoundExceeded { norm, bound }` -- a well-formed update
+  violating a usable bound. Structural, so the audit integration records the
+  measurements without parsing a rendered message; `norm` is `f64`, matching the
+  computation. Distinct from `NonFiniteValue` (malformed update, no meaningful
+  norm) and `InvalidNormBound` (unusable threshold).
+- `tests/norm_bound_filtering.rs` (30 tests) and `tests/audited_aggregation.rs`
+  (24 tests): default-disabled behavior, bound validation at construction and on
+  deserialization, 0.3.1 configurations restoring with filtering off, boundary
+  behavior at and either side of the bound, `f64` exactness at 1e20 and 1e-25,
+  weight and client-ID alignment through a rejection, reputation left untouched,
+  fail-closed for reputation-only, norm-only, and mixed rejection, method quorum
+  evaluated against the accepted cohort, and the audit record's contents,
+  effective parameters present after a successful round and absent after a
+  refused one, and JSON round trip. 22 Python tests cover the exposed
+  configuration through the bindings and the Flower adapter.
+- `src/validation.rs`: `validate_updates`, `validate_weights`,
+  `validate_client_ids`, plus module documentation recording why non-finite
+  input is rejected rather than sanitized. Crate-private, and located at the
+  crate root rather than under `aggregators` because `verification` needs it
+  too and `aggregators` already depends on `verification`.
+- `verification::krum_min_clients(f)` -- minimum client count for a given `f`,
+  with saturating arithmetic. Re-exported from `verification`.
+- `verification::max_multi_krum_m(n, f)` -- largest `m` Multi-Krum may select
+  for a given `(n, f)`, or 0 when the quorum condition fails. Re-exported from
+  `verification`.
+- `QoraError::InvalidMultiKrumSelection { clients, byzantine, selected,
+  maximum }` -- raised for an explicit `m` outside the safe range.
+- **Experimental, versioned `AggregationAuditEntry` schema** (`src/audit.rs`)
+  for recording per-update acceptance and rejection decisions, returned by the
+  audited aggregation APIs above. Audit records are caller-owned: Qora-FL does
+  not persist them and does not retain them inside `ByzantineAggregator`.
 
-- **Non-finite client weights are now rejected.** New
-  `QoraError::NonFiniteWeight { index, value }`. Updates could be entirely
-  well-formed while a single NaN weight destroyed the weighted mean.
+  One `AggregationAuditDecision` per submitted update, carrying its original
+  index, an optional client ID, and a typed `AggregationDecision` -- so every
+  input has exactly one disposition and the counts are derived rather than
+  stored alongside. Rejection reasons are typed
+  (`AggregationRejectionReason::{ReputationBelowThreshold, NormBoundExceeded}`)
+  rather than strings; the norm is `f64`, matching `check_norm_bound`.
+  `AggregationAuditOutcome` distinguishes `Aggregated` from
+  `AllUpdatesRejected`, so a round that produced nothing can still explain why.
 
-- **Non-finite updates were invisible to reputation tracking.** A NaN
-  distance-to-aggregate satisfies neither `distance < 1.0` nor
-  `distance > 10.0`, so the offending client was never rewarded *or* penalized,
-  leaving it permanently unbannable. Validation now runs before reputation
-  gating, so such a round is refused outright and no score moves.
+  `method` records the **effective** parameters via the new
+  `AuditedAggregationMethod`, not the configuration-only `AggregationMethod`.
+  Two methods resolve parameters at aggregation time, and a record of the
+  configuration alone cannot explain what ran: under `adaptive_trim` the trim
+  fraction is recomputed each round, and `AggregationMethod::TrimmedMean`
+  carries no fraction at all; a bare `"multi_krum"` resolves `m` to
+  `min(3, n - 2f - 2)`. The descriptor keeps both sides -- `configured` and
+  `effective` trim fractions with an `adaptive` flag, and `requested_m`
+  alongside `effective_m` -- so a reader can tell a deliberate setting from a
+  runtime resolution. Being an enum, it also makes nonsense combinations such
+  as a FedAvg record carrying a trim fraction unrepresentable.
 
-- **`client_ids` / `updates` count mismatches now return an error instead of
-  potentially panicking.** New `QoraError::ClientIdCountMismatch { updates,
-  client_ids }`, checked before any filtering or indexing. Supplying more IDs
-  than updates previously panicked with `index out of bounds` inside the
-  ban-threshold filter, a path reachable through the PyO3 API. Supplying fewer
-  silently succeeded while attributing reputation to only a prefix of the
-  clients, because `update_reputations` zips and stops at the shorter side.
+  **The runtime-resolved values are `Option`.** `effective_trim_fraction` is
+  `Option<f32>` and `effective_m` is `Option<usize>`, `Some` exactly when the
+  outcome is `Aggregated`. A round that rejected every update resolved nothing:
+  no fraction was applied and no vectors were selected, so recording a value
+  there would name a parameter that never executed. This matters most for a
+  bare `"multi_krum"`, whose `m` is resolved against the accepted cohort --
+  with an empty cohort there is nothing to cap the default against.
+  Configuration is still reported in full, since the configured fraction, the
+  `adaptive` flag, `f`, and `requested_m` are known regardless of what ran.
+
+  Method parameters are validated too, on construction *and* deserialization:
+  trim fractions must be finite and within `0.0..=0.5`, a non-adaptive record
+  must apply its configured fraction, `2f + 3` must not overflow, `effective_m`
+  must be at least 1, and an explicit `requested_m` must equal `effective_m` --
+  an explicit request is honored exactly or refused, never silently resolved to
+  something else. The effective values are checked against the outcome in both
+  directions: `Aggregated` carrying `None` is rejected because something ran and
+  the parameter it ran with exists, and `AllUpdatesRejected` carrying `Some` is
+  rejected because nothing ran. `effective_m` is deliberately not checked
+  against the cohort size, which the entry does not know.
+
+  Entries carry no timestamps, round numbers, experiment identifiers, or model
+  data -- the library has no clock, no notion of a training round, and no
+  reason to copy update values into a record. Callers wrap the entry in their
+  own structure when they need those.
+
+  Invariants (one decision per update, contiguous indices, outcome consistent
+  with the accepted count, finite in-range measurements) are enforced on
+  construction *and* deserialization, so an entry cannot describe an
+  impossible attempt. `AGGREGATION_AUDIT_SCHEMA_VERSION` versions the
+  serialized shape, not the package; the rejection-reason and outcome enums are
+  `#[non_exhaustive]`. Wire stability is not promised while the schema is
+  experimental, and a serializable record is not a tamper-proof audit log.
+
+  The pre-existing `verification::audit` types are unchanged and remain unused;
+  they are documented as superseded.
+- `QoraError::InvalidAuditEntry { reason }` -- raised when an audit entry would
+  not describe a possible aggregation attempt.
+- `QoraError::AllUpdatesRejected { submitted }` -- raised when participation
+  filtering leaves no client.
+- `QoraError::InvalidReputationScore`, `InvalidReputationAdjustment`,
+  `InvalidReputationDecay`, `InvalidReputationThreshold`, and
+  `NonFiniteReputationDistance` -- typed rejections for each reputation input
+  class, so a caller can tell an invalid score from an invalid amount, decay
+  factor, or threshold.
+- `src/reputation/validate.rs`: the four numeric rules in one place, with the
+  reasoning for rejecting rather than clamping.
+- `tests/reputation_numeric.rs`: 27 integration tests covering each rejection,
+  atomicity of failed operations, saturation of large valid amounts,
+  deserialization rejection, and end-to-end aggregation keeping every score in
+  range. Plus unit tests for the read-side defences and for the `f64` distance
+  at both extremes, and 11 Python tests over the exposed methods.
+- `tests/reputation_gating.rs`: 12 integration tests covering the typed error
+  and its fields, non-restoration of a partially rejected cohort, precedence
+  over method execution, reputation state being unchanged on the error path,
+  and validation still outranking gating. Five Python tests cover the same
+  behavior through the bindings.
+- `tests/multi_krum_bounds.rs`: 13 integration tests covering the cap applied
+  to an omitted `m`, rejection of explicit out-of-range values, quorum
+  precedence, low-level `None` returns, and serde round-trips of both forms.
+  Six Python tests cover the same contract through the bindings.
+- `docs/SECURITY_NOTES.md` recording the measured pre-fix behavior behind each
+  fix in this release.
+- 33 new tests, bringing the suite from 145 to 178:
+  - 20 integration tests in the new `tests/input_validation.rs`, each
+    documenting the pre-fix behavior it pins.
+  - 13 unit tests: 12 in `src/aggregators/validate.rs`, 1 in
+    `src/verification/krum_condition.rs`.
+  - Totals by target: 103 unit + 74 integration (54 `aggregator_tests` + 20
+    `input_validation`) + 1 doctest.
 
 ### Changed
-
 - **The Flower strategy now validates complete client model structures**,
   aggregates each client model as one flattened update, and restores the
   original layer shapes afterward. Every client is checked against the first
@@ -442,203 +500,147 @@ that exists in this repository.
   be removed without changing the signature; verification uses `l2_norm`
   instead.
 
-### Added
+### Fixed
+- **The Flower adapter aggregated and updated reputation per layer instead of
+  once per complete client model.** Each layer was passed to the aggregator in
+  a separate call, so a selection method could choose a *different client for
+  each layer* and return a model no client submitted. Reputation was computed
+  from the first layer only, which let a client match the cohort on layer 0 and
+  deviate arbitrarily on every later layer without penalty. Complete models are
+  now flattened into one update, aggregated in a single call, and split back
+  into their original layer shapes.
+- **Flower is now installed in Python CI**, so `QoraStrategy` is imported and
+  exercised against real `FitRes`, `Status`, and `Parameters` types. The
+  adapter previously had no CI coverage at all -- the job never installed
+  Flower, so the import could not even be attempted.
 
-- **Optional norm-bound filtering on `ByzantineAggregator`.** Filtering is
-  **disabled by default** and excludes updates whose finite `f64` L2 norm
-  exceeds a configured positive bound.
+- **Multi-Krum now enforces its documented selection bound
+  `1 <= m <= n - 2f - 2`** (Blanchard et al., 2017). `aggregate_multi_krum_bfp16`
+  previously clamped with `m.max(1).min(n)`, so an oversized `m` returned a
+  normal-looking selection that carried no Byzantine guarantee -- the same
+  failure mode as the single-Krum "best-effort" path removed earlier in this
+  cycle. The low-level function now returns `None`; `ByzantineAggregator`
+  reports the new `QoraError::InvalidMultiKrumSelection`.
 
-  Configured with `with_norm_bound_filter(bound) -> Result<Self, QoraError>`,
-  cleared with `without_norm_bound_filter()`, read back with `norm_bound()`. In
-  Python: `ByzantineAggregator(method, trim_fraction, norm_bound=...)` and
-  `QoraStrategy(..., norm_bound=...)`, where `None` is disabled. A bound must be
-  finite and strictly positive; zero, negative, NaN, and infinite bounds return
-  `QoraError::InvalidNormBound` (Python `ValueError`) rather than being clamped,
-  and the same validation runs on deserialization.
+  This matters most after reputation gating, where the effective `n` shrinks
+  between rounds and a fixed `m` can silently drift out of range.
+- Norm-bound verification now computes L2 norms with `f64` accumulation,
+  preventing finite large updates from overflowing to infinity and very small
+  updates from underflowing to zero.
+- `check_norm_bound` now rejects non-finite update coordinates with
+  `QoraError::NonFiniteValue`.
+- Zero, negative, NaN, and infinite norm bounds now return
+  `QoraError::InvalidNormBound`.
+- Norm-bound rejection messages now report the finite computed norm using
+  scientific notation.
 
-  With no bound configured, no norm is computed and behavior is exactly as
-  before. With one configured:
+### Deprecated
+- Deprecated `verification::audit::AggregationAuditEntry` in favor of the new
+  root-level `AggregationAuditEntry` schema. The two are different types that
+  happen to share a name, and **their serialized shapes are not compatible**:
+  the legacy record holds `round`, `n_clients`, `n_excluded`, a free-form
+  `method` string, and `trim_fraction`, while the new one holds a schema
+  version, the full `AggregationMethod`, a per-update decision list, and an
+  outcome. Stored legacy records cannot be read as the new type; there is no
+  automatic migration.
+- Deprecated `verification::audit::AuditLog`. Audit persistence is now
+  caller-owned and **no replacement storage implementation is provided** --
+  serialize `AggregationAuditEntry` and store the records with whatever the
+  application already uses.
 
-  - The norm is computed in `f64` and compared inclusively -- a norm exactly
-    equal to the bound participates, matching `check_norm_bound`, which now
-    shares the comparison through the internal `evaluate_norm_bound`.
-  - A rejected update's client ID and FedAvg sample weight are removed with it,
-    so a rejected weight cannot reach the numerator or the denominator or attach
-    to another client.
-  - **A rejected update does not affect reputation** -- no reward, no penalty,
-    no ban, and its stored score does not move however many rounds it is
-    excluded for. A norm bound is a participation filter, not a reputation
-    policy; a large norm is a policy violation rather than proof of malicious
-    intent, and this filter does not claim to detect Byzantine behavior. (This
-    reverses the tentative position in
-    `docs/VERIFICATION_INTEGRATION.md` §7, which is amended in place.)
-  - Reputation gating runs first, and a client it removes is not measured again,
-    so every submitted update carries at most one rejection reason.
-  - Malformed input still outranks filtering: empty batches, dimension
-    mismatches, non-finite values or weights, and client-ID count mismatches are
-    errors, never filtering decisions.
-  - If nothing survives, the round fails closed with
-    `QoraError::AllUpdatesRejected`.
+  Neither type is removed, so 0.3 callers keep compiling; both will be removed
+  in a future breaking release. The `verification::` re-export carries a
+  statement-scoped `#[allow(deprecated)]` so the re-export itself does not warn
+  while callers reaching the types through it still do.
+- `filter_by_norm_bound` is deprecated because it silently discards
+  verification errors. Callers should use `check_norm_bound` and handle each
+  result explicitly.
 
-  `verification::filter_by_norm_bound` remains deprecated and is **not** used by
-  the integration: it discards errors silently and cannot report per-update
-  reasons.
+### Security
+- **Non-finite values in client updates are now rejected** instead of silently
+  corrupting the aggregate. New `QoraError::NonFiniteValue { update_index, row,
+  col, value }`, enforced by `validation::validate_updates` and
+  called from `ByzantineAggregator::aggregate` as well as from `trimmed_mean`,
+  `median`, and `fedavg` directly, so the guarantee does not depend on which
+  entry point a caller uses.
 
-- **Audited aggregation.** `ByzantineAggregator::aggregate_with_audit` and
-  `aggregate_weighted_with_audit` return an `AuditedAggregation` -- the
-  aggregate plus the caller-owned `AggregationAuditEntry` schema added earlier
-  in this cycle -- or an `AuditedAggregationError`.
+  All five methods previously accepted non-finite input without error, each
+  failing differently: the coordinate-wise methods became order-dependent (a
+  NaN's effect varied with which client submitted it), `fedavg` propagated it to
+  every output coordinate, and `krum` / `multi_krum` could not observe it at all
+  because BFP-16 encoding quantizes NaN to a zero mantissa -- which could make a
+  poisoned vector score as *closer* to the honest cluster than a genuine
+  outlier. Measured pre-fix behavior for each method is recorded in
+  [docs/SECURITY_NOTES.md](docs/SECURITY_NOTES.md).
 
-  The error type exists because `Result<_, QoraError>` would discard the record
-  in exactly the round it matters most: `AuditedAggregationError::audit()`
-  carries the per-update reasons through an all-rejected failure. It exposes
-  `source_error()`, `audit()`, and `into_parts()`, and converts into
-  `QoraError`.
+- **Non-finite client weights are now rejected.** New
+  `QoraError::NonFiniteWeight { index, value }`. Updates could be entirely
+  well-formed while a single NaN weight destroyed the weighted mean.
 
-  Records are handed to the caller and not retained. Nothing is persisted or
-  logged, no entry is stored inside the aggregator, and the serialized
-  aggregator does not grow with the round count.
+- **Non-finite updates were invisible to reputation tracking.** A NaN
+  distance-to-aggregate satisfies neither `distance < 1.0` nor
+  `distance > 10.0`, so the offending client was never rewarded *or* penalized,
+  leaving it permanently unbannable. Validation now runs before reputation
+  gating, so such a round is refused outright and no score moves.
 
-  Which failures carry a record: an all-rejected round does; input validation,
-  invalid configuration, a method-precondition failure after some candidates
-  survived, and a post-aggregation reputation failure do not. Schema version 1
-  has two outcomes -- aggregated, and all updates rejected -- and a round where
-  some candidates survived but Krum refused the reduced cohort is neither.
-  Rather than attach a record describing something that did not happen, the
-  typed error is returned alone. A future schema version may add a failure
-  outcome.
+- **`client_ids` / `updates` count mismatches now return an error instead of
+  potentially panicking.** New `QoraError::ClientIdCountMismatch { updates,
+  client_ids }`, checked before any filtering or indexing. Supplying more IDs
+  than updates previously panicked with `index out of bounds` inside the
+  ban-threshold filter, a path reachable through the PyO3 API. Supplying fewer
+  silently succeeded while attributing reputation to only a prefix of the
+  clients, because `update_reputations` zips and stops at the shorter side.
 
-  A record from an all-rejected round reports **no effective method
-  parameters**: nothing executed, so `effective_trim_fraction` and `effective_m`
-  are `None` rather than values that were never applied.
+### Documentation
+No behavior changed in this set; every item aligns a public claim with evidence
+that exists in this repository.
 
-- `QoraError::NormBoundExceeded { norm, bound }` -- a well-formed update
-  violating a usable bound. Structural, so the audit integration records the
-  measurements without parsing a rendered message; `norm` is `f64`, matching the
-  computation. Distinct from `NonFiniteValue` (malformed update, no meaningful
-  norm) and `InvalidNormBound` (unusable threshold).
-- `tests/norm_bound_filtering.rs` (30 tests) and `tests/audited_aggregation.rs`
-  (24 tests): default-disabled behavior, bound validation at construction and on
-  deserialization, 0.3.1 configurations restoring with filtering off, boundary
-  behavior at and either side of the bound, `f64` exactness at 1e20 and 1e-25,
-  weight and client-ID alignment through a rejection, reputation left untouched,
-  fail-closed for reputation-only, norm-only, and mixed rejection, method quorum
-  evaluated against the accepted cohort, and the audit record's contents,
-  effective parameters present after a successful round and absent after a
-  refused one, and JSON round trip. 22 Python tests cover the exposed
-  configuration through the bindings and the Flower adapter.
-- `src/validation.rs`: `validate_updates`, `validate_weights`,
-  `validate_client_ids`, plus module documentation recording why non-finite
-  input is rejected rather than sanitized. Crate-private, and located at the
-  crate root rather than under `aggregators` because `verification` needs it
-  too and `aggregators` already depends on `verification`.
-- `verification::krum_min_clients(f)` -- minimum client count for a given `f`,
-  with saturating arithmetic. Re-exported from `verification`.
-- `verification::max_multi_krum_m(n, f)` -- largest `m` Multi-Krum may select
-  for a given `(n, f)`, or 0 when the quorum condition fails. Re-exported from
-  `verification`.
-- `QoraError::InvalidMultiKrumSelection { clients, byzantine, selected,
-  maximum }` -- raised for an explicit `m` outside the safe range.
-- **Experimental, versioned `AggregationAuditEntry` schema** (`src/audit.rs`)
-  for recording per-update acceptance and rejection decisions. Audit records
-  are caller-owned: Qora-FL does not persist them, does not retain them inside
-  `ByzantineAggregator`, and the aggregation API does not yet return them.
-  Integration is future work.
-
-  One `AggregationAuditDecision` per submitted update, carrying its original
-  index, an optional client ID, and a typed `AggregationDecision` -- so every
-  input has exactly one disposition and the counts are derived rather than
-  stored alongside. Rejection reasons are typed
-  (`AggregationRejectionReason::{ReputationBelowThreshold, NormBoundExceeded}`)
-  rather than strings; the norm is `f64`, matching `check_norm_bound`.
-  `AggregationAuditOutcome` distinguishes `Aggregated` from
-  `AllUpdatesRejected`, so a round that produced nothing can still explain why.
-
-  `method` records the **effective** parameters via the new
-  `AuditedAggregationMethod`, not the configuration-only `AggregationMethod`.
-  Two methods resolve parameters at aggregation time, and a record of the
-  configuration alone cannot explain what ran: under `adaptive_trim` the trim
-  fraction is recomputed each round, and `AggregationMethod::TrimmedMean`
-  carries no fraction at all; a bare `"multi_krum"` resolves `m` to
-  `min(3, n - 2f - 2)`. The descriptor keeps both sides -- `configured` and
-  `effective` trim fractions with an `adaptive` flag, and `requested_m`
-  alongside `effective_m` -- so a reader can tell a deliberate setting from a
-  runtime resolution. Being an enum, it also makes nonsense combinations such
-  as a FedAvg record carrying a trim fraction unrepresentable.
-
-  **The runtime-resolved values are `Option`.** `effective_trim_fraction` is
-  `Option<f32>` and `effective_m` is `Option<usize>`, `Some` exactly when the
-  outcome is `Aggregated`. A round that rejected every update resolved nothing:
-  no fraction was applied and no vectors were selected, so recording a value
-  there would name a parameter that never executed. This matters most for a
-  bare `"multi_krum"`, whose `m` is resolved against the accepted cohort --
-  with an empty cohort there is nothing to cap the default against.
-  Configuration is still reported in full, since the configured fraction, the
-  `adaptive` flag, `f`, and `requested_m` are known regardless of what ran.
-
-  Method parameters are validated too, on construction *and* deserialization:
-  trim fractions must be finite and within `0.0..=0.5`, a non-adaptive record
-  must apply its configured fraction, `2f + 3` must not overflow, `effective_m`
-  must be at least 1, and an explicit `requested_m` must equal `effective_m` --
-  an explicit request is honored exactly or refused, never silently resolved to
-  something else. The effective values are checked against the outcome in both
-  directions: `Aggregated` carrying `None` is rejected because something ran and
-  the parameter it ran with exists, and `AllUpdatesRejected` carrying `Some` is
-  rejected because nothing ran. `effective_m` is deliberately not checked
-  against the cohort size, which the entry does not know.
-
-  Entries carry no timestamps, round numbers, experiment identifiers, or model
-  data -- the library has no clock, no notion of a training round, and no
-  reason to copy update values into a record. Callers wrap the entry in their
-  own structure when they need those.
-
-  Invariants (one decision per update, contiguous indices, outcome consistent
-  with the accepted count, finite in-range measurements) are enforced on
-  construction *and* deserialization, so an entry cannot describe an
-  impossible attempt. `AGGREGATION_AUDIT_SCHEMA_VERSION` versions the
-  serialized shape, not the package; the rejection-reason and outcome enums are
-  `#[non_exhaustive]`. Wire stability is not promised while the schema is
-  experimental, and a serializable record is not a tamper-proof audit log.
-
-  The pre-existing `verification::audit` types are unchanged and remain unused;
-  they are documented as superseded.
-- `QoraError::InvalidAuditEntry { reason }` -- raised when an audit entry would
-  not describe a possible aggregation attempt.
-- `QoraError::AllUpdatesRejected { submitted }` -- raised when participation
-  filtering leaves no client.
-- `QoraError::InvalidReputationScore`, `InvalidReputationAdjustment`,
-  `InvalidReputationDecay`, `InvalidReputationThreshold`, and
-  `NonFiniteReputationDistance` -- typed rejections for each reputation input
-  class, so a caller can tell an invalid score from an invalid amount, decay
-  factor, or threshold.
-- `src/reputation/validate.rs`: the four numeric rules in one place, with the
-  reasoning for rejecting rather than clamping.
-- `tests/reputation_numeric.rs`: 27 integration tests covering each rejection,
-  atomicity of failed operations, saturation of large valid amounts,
-  deserialization rejection, and end-to-end aggregation keeping every score in
-  range. Plus unit tests for the read-side defences and for the `f64` distance
-  at both extremes, and 11 Python tests over the exposed methods.
-- `tests/reputation_gating.rs`: 12 integration tests covering the typed error
-  and its fields, non-restoration of a partially rejected cohort, precedence
-  over method execution, reputation state being unchanged on the error path,
-  and validation still outranking gating. Five Python tests cover the same
-  behavior through the bindings.
-- `tests/multi_krum_bounds.rs`: 13 integration tests covering the cap applied
-  to an omitted `m`, rejection of explicit out-of-range values, quorum
-  precedence, low-level `None` returns, and serde round-trips of both forms.
-  Six Python tests cover the same contract through the bindings.
-- `docs/SECURITY_NOTES.md` recording the measured pre-fix behavior behind each
-  fix in this release.
-- 33 new tests, bringing the suite from 145 to 178:
-  - 20 integration tests in the new `tests/input_validation.rs`, each
-    documenting the pre-fix behavior it pins.
-  - 13 unit tests: 12 in `src/aggregators/validate.rs`, 1 in
-    `src/verification/krum_condition.rs`.
-  - Totals by target: 103 unit + 74 integration (54 `aggregator_tests` + 20
-    `input_validation`) + 1 doctest.
+- Clarified the assumptions and enforced preconditions for trimmed mean,
+  median, Krum, and Multi-Krum. A trim fraction is no longer presented as an
+  attacker percentage, and median is stated as requiring *strictly fewer than*
+  50% adversarial values per coordinate rather than tolerating 50%.
+- Narrowed determinism claims to integer Krum scoring after BFP-16 encoding.
+  The previous "deterministic aggregation paths" and "bit-perfect agreement"
+  wording covered a pipeline that begins with floating-point encoding and ends
+  with `f32` results.
+- Documented the Flower adapter's sample weighting, model validation, failure
+  policy, metrics behavior, and optional-dependency status, including the
+  supported and CI-tested Flower versions.
+- Clarified that reputation currently provides tracking and participation
+  gating. Cubic influence weighting exists as a utility and is not consumed by
+  any aggregation path; it is listed as roadmap work rather than a feature.
+- Reframed QRES as project history rather than validation evidence. The
+  181-day deployment, ESP32 hardware, and "Slander-Amplification" references
+  no longer appear as support for claims about Qora-FL, whose evidence is its
+  own tests and experiments.
+- Corrected the QRES repository link, which pointed at a 404
+  (`CavinKrenik/RaaS` → `CavinKrenik/QRES_RaaS`).
+- Added explicit experimental status, a "currently implemented" versus
+  "experimental or planned" split, and a validation-status section noting the
+  absence of an independent security review.
+- Rewrote `SECURITY.md` to separate what the project enforces from what it does
+  not provide, and to replace the single project-wide "30% Byzantine" threat
+  model with per-method assumptions.
+- Removed the published benchmark figures and their directional conclusions.
+  The evaluation script and its full configuration remain documented, along
+  with the two properties that stop a run from being reproducible evidence: the
+  dataset can be substituted silently when the OpenML fetch fails, and each
+  configuration runs once, giving no variance estimate. Publishing results again
+  requires a pinned dataset, multiple seeds, and saved machine-readable output.
+- Fixed a non-working Rust example in the README: `trim_fraction = 0.3` with
+  four clients trims every value and returns `InsufficientQuorum`.
+- Documented the shipped norm-filtering and audit behavior across `README.md`,
+  `bindings/python/README.md`, `docs/TUNING.md`, `SECURITY.md`, and
+  `docs/SECURITY_NOTES.md`: that filtering is optional and off by default, that
+  a norm violation is a policy violation rather than proof of malicious intent,
+  and that audit records are caller-owned observability rather than evidence.
+- Added [`docs/MIGRATING_TO_0.4.md`](docs/MIGRATING_TO_0.4.md), covering every
+  breaking change in this release with before/after guidance.
+- `docs/VERIFICATION_INTEGRATION.md` records the policy decisions behind the
+  norm-filtering integration, including the two that were reversed when the
+  design met the implementation.
 
 ### Known limitations (deliberately deferred)
-
 - **`Bfp16Vec::from_f32_slice` does not validate its input.** It remains a
   laundering entrance for callers who bypass `ByzantineAggregator`: `NaN`
   becomes a zero mantissa, and `inf` saturates the shared exponent to 126,
@@ -675,6 +677,33 @@ that exists in this repository.
   freeze a binding design while the schema is still experimental. A later
   binding can return the serialized shape as a dictionary. Norm-bound
   *configuration* is exposed.
+
+### Migration notes
+
+Full guidance with before/after examples:
+**[docs/MIGRATING_TO_0.4.md](docs/MIGRATING_TO_0.4.md)**.
+
+Breaking changes at a glance:
+
+| Change | Action |
+|---|---|
+| `QoraError::AllUpdatesRejected { total, rejected, threshold }` → `{ submitted }` | Update destructuring; the rendered message changed, so update Python message matching too |
+| `AggregationMethod::MultiKrum(usize, usize)` → `(usize, Option<usize>)` | `MultiKrum(f, m)` → `MultiKrum(f, Some(m))`, or `None` for the adaptive default |
+| Krum / Multi-Krum refuse inputs below `n >= 2f + 3` | Confirm cohort sizes; there is no best-effort path |
+| Explicit Multi-Krum `m > n - 2f - 2` now errors | Confirm stored `m` fits the smallest expected cohort, or set it to `null` |
+| Seven reputation calls now return `Result` | Add `?` or explicit handling |
+| Reputation state validated on deserialization | Clamp or drop out-of-range scores in stored files |
+| `check_norm_bound` returns `NormBoundExceeded`, not `VerificationError` | Update matches |
+| New `QoraError` variants | Add a `_` arm or handle them |
+| Flower: complete-model aggregation | Expect different aggregates for multi-layer models under Krum / Multi-Krum |
+| Flower: integer parameter arrays rejected | Convert to a floating-point dtype |
+| Flower: automatic `qora_*` and `reputation_<cid>` metrics removed | Supply `fit_metrics_aggregation_fn` |
+| Legacy and new audit schemas are not wire-compatible | No automatic migration; stored legacy records cannot be read as the new type |
+
+Not breaking: norm-bound filtering and audit records are both opt-in. Code that
+does not configure a bound or call an audited API is unaffected by either.
+A 0.3.1 aggregator configuration without the `norm_bound` field deserializes
+with filtering disabled.
 
 ## [0.3.1] - 2026-02-08
 
@@ -765,3 +794,9 @@ that exists in this repository.
 - Quorum consensus implementation
 - Comprehensive test suite
 - Published to crates.io
+
+[Unreleased]: https://github.com/CavinKrenik/qora-fl/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/CavinKrenik/qora-fl/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/CavinKrenik/qora-fl/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/CavinKrenik/qora-fl/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/CavinKrenik/qora-fl/releases/tag/v0.2.0

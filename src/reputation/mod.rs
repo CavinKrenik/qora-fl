@@ -28,6 +28,25 @@
 //! Distances driving reputation updates are accumulated in `f64` with operands
 //! widened before subtraction; see [`crate::math::norms`].
 //!
+//! # What does *not* move a score
+//!
+//! Only clients whose updates reached the aggregate are scored, and only by
+//! their distance to it. In particular, **optional norm-bound filtering carries
+//! no reputation consequence**: a client excluded by
+//! [`crate::ByzantineAggregator::with_norm_bound_filter`] is absent from the
+//! distance measurement and its stored score does not move, in either direction,
+//! however many rounds it is excluded for.
+//!
+//! That is deliberate. A norm bound is a participation filter reflecting a
+//! magnitude policy the operator chose; reputation reflects accumulated
+//! deviation evidence. Folding the first into the second would mean tightening a
+//! bound silently changes trust dynamics, and could ban clients for a threshold
+//! they never agreed to. Making norm violations affect reputation would be a
+//! separately designed feature.
+//!
+//! A round that fails -- including one where filtering rejected every update --
+//! moves no score at all, so a caller retrying it does not compound penalties.
+//!
 //! # Influence Formula: `min(rep^3, 0.8)`
 //!
 //! Cubic influence weighting and its cap are available as utilities --

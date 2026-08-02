@@ -4,7 +4,9 @@ Detailed analysis behind security-relevant changes. Each note records the
 behavior that was measured *before* the fix, so the reasoning survives beyond
 the changelog entry that summarizes it.
 
-For reporting vulnerabilities, see [SECURITY.md](../SECURITY.md).
+For reporting vulnerabilities, see [SECURITY.md](../SECURITY.md). For the limits
+of what 0.4.0's new features do and do not claim, see [Limits of the 0.4.0
+additions](#limits-of-the-040-additions) at the end of this file.
 
 ---
 
@@ -207,3 +209,101 @@ Regressed by `aggregator_krum_rejects_invalid_condition`,
 `low_level_krum_returns_none_when_condition_is_invalid` (which cross-checks both
 paths against `krum_condition_met` over an `n` x `f` grid), and
 `krum_min_clients_saturates_on_absurd_f`.
+
+---
+
+## 2026-07-29 -- Norm-bound verification failed in both directions
+
+Affects all releases up to and including 0.3.1. Fixed on the
+`fix/norm-verification` branch, before norm filtering was wired into
+aggregation.
+
+### Summary
+
+`check_norm_bound` existed, was tested, and was called by nothing. Its
+implementation had two numeric defects and two misattribution defects. Because
+no aggregation path used it, none of them could affect a round -- but the
+function was public, and a caller implementing its own filtering on top of it
+would have inherited all four.
+
+### Measured pre-fix behavior
+
+| Input | Bound | Pre-fix result | Problem |
+|---|---|---|---|
+| `[1.0, NaN]` | `10.0` | `Err("Update norm NaN exceeds bound 10.0000")` | Malformed input reported as a policy violation, in a message that is not a true statement |
+| `[1.0, inf]` | `10.0` | `Err("Update norm inf exceeds bound 10.0000")` | Same |
+| `[1e20, 1e20]` (true norm ~1.41e20) | `1e30` | `Err(...)` | **False reject.** `l2_norm_sq` accumulated in `f32`, so the squared sum (1e40) saturated to `inf` and exceeded every finite bound -- for an update four orders of magnitude *inside* its bound |
+| `[1e-25, 1e-25]` (true norm ~1.41e-25) | `1e-26` | `Ok(())` | **False accept.** Each squared term (1e-50) underflowed below the smallest `f32` subnormal, so the norm came back exactly `0.0`, which passes any positive bound |
+| `[1.0, 0.0]` | `inf` | `Ok(())` | A bound that verifies nothing while appearing configured |
+| `[1.0, 0.0]` | `NaN` | `Err(...)` | Rejects everything, with no distinct error |
+| `[1.0, 0.0]` | `0.0` / `-1.0` | `Err(...)` | Rejects everything as if oversized |
+
+The underflow row is the one that fails open, and it is the reason this was
+fixed before any integration rather than alongside it: a client submitting
+sufficiently small coordinates would have passed a bound it genuinely exceeded.
+
+### Fix
+
+Norms accumulate in `f64` via `l2_norm_f64`, which carries `f32::MAX^2`
+(~1.2e77) with room to spare. Non-finite coordinates return
+`QoraError::NonFiniteValue` with the offending `[row, col]`; an unusable bound
+returns `QoraError::InvalidNormBound`; a valid update exceeding a valid bound
+returns the typed `QoraError::NormBoundExceeded { norm, bound }` carrying the
+measurements as fields. Equality is acceptance.
+
+`filter_by_norm_bound` converted every one of the above into a silent index
+drop -- a NaN update simply vanished from the returned indices with no error and
+no record. It is deprecated rather than repaired, and the 0.4.0 aggregation path
+does not call it.
+
+Regressed by the `src/verification/norm_bound.rs` unit tests, which pin each row
+of the table above, and by `tests/norm_bound_filtering.rs`, which pins the same
+boundaries through the aggregator.
+
+---
+
+## Limits of the 0.4.0 additions
+
+**Not a fix record.** The two features added in 0.4.0 are recorded here so their
+limits sit beside the defect history rather than only in release notes.
+
+### Norm-bound filtering enforces a policy; it does not detect attacks
+
+Disabled by default. When enabled it excludes updates whose `f64` L2 norm
+exceeds a caller-chosen bound, and that is the entire claim.
+
+- An accepted update is **not** thereby honest. A poisoned update crafted to
+  stay under the bound passes untouched, and staying under a published bound is
+  trivial for an attacker who knows it.
+- A rejected update is **not** thereby malicious. Legitimate causes include a
+  high learning rate, many local epochs, an unusually large local dataset, or a
+  bound derived from a different model or training stage.
+- The filter has no memory. It makes no cross-round inference and does not move
+  reputation in either direction.
+
+Two operational risks:
+
+- **Denial of service by misconfiguration.** A bound below honest variation
+  rejects honest clients; if it rejects all of them the round fails closed and
+  training stalls. Failing closed is the intended direction -- it is still a
+  stall, and it is reachable by setting one number wrong.
+- **Cohort reduction below quorum.** Preconditions are checked against the
+  accepted cohort, so an attacker who can predict the bound can submit
+  deliberately over-bound updates to push `n` below `2f + 3` and force Krum or
+  Multi-Krum to refuse rounds it would otherwise have aggregated. A cohort sized
+  exactly at `2f + 3` has no margin for a single rejection.
+
+### Audit records are observability, not evidence
+
+`AggregationAuditEntry` is a plain serializable struct. It is not immutable, not
+signed, not hashed, not chained, and not ordered across rounds. Qora-FL does not
+persist it, so nothing about it is verifiable after the fact beyond what the
+caller's own storage guarantees.
+
+Entries carry whatever client identifiers the caller supplied and should be
+handled under the caller's privacy policy. They carry no model data and no
+hashes of model data -- deliberately, since an unkeyed hash can leak information
+while creating a false impression of cryptographic auditability.
+
+A record showing a rejection states what the configured policy did. It is not an
+attestation that anything was verified.

@@ -12,10 +12,12 @@ use qora_fl::{
     AggregationRejectionReason, AuditedAggregationMethod, AGGREGATION_AUDIT_SCHEMA_VERSION,
 };
 
-/// Static trimmed mean, serialized.
+/// Static trimmed mean that ran, serialized.
 const STATIC_TRIM: &str = r#"{"trimmed_mean":{"configured_trim_fraction":0.25,"effective_trim_fraction":0.25,"adaptive":false}}"#;
 /// Adaptive trimmed mean whose round value differs from its baseline.
 const ADAPTIVE_TRIM: &str = r#"{"trimmed_mean":{"configured_trim_fraction":0.125,"effective_trim_fraction":0.375,"adaptive":true}}"#;
+/// The same configuration for a round that aggregated nothing.
+const UNRUN_TRIM: &str = r#"{"trimmed_mean":{"configured_trim_fraction":0.25,"effective_trim_fraction":null,"adaptive":false}}"#;
 
 /// Build a JSON entry the way a caller's stored record would look.
 fn entry_json(method: &str, decisions: &str, outcome: &str) -> String {
@@ -51,6 +53,10 @@ fn norm_rejected(index: usize, id: Option<&str>, norm: f64, bound: f32) -> Strin
 
 fn parse(json: &str) -> AggregationAuditEntry {
     serde_json::from_str(json).unwrap_or_else(|e| panic!("entry must deserialize: {}\n{}", e, json))
+}
+
+fn parse_result(json: &str) -> Result<AggregationAuditEntry, serde_json::Error> {
+    serde_json::from_str(json)
 }
 
 // ===== The five scenarios the schema must be able to represent =====
@@ -225,7 +231,7 @@ fn method_parameters_survive_the_public_boundary() {
         &AuditedAggregationMethod::MultiKrum {
             f: 1,
             requested_m: None,
-            effective_m: 2,
+            effective_m: Some(2),
         }
     );
     assert_eq!(
@@ -233,10 +239,76 @@ fn method_parameters_survive_the_public_boundary() {
         &AuditedAggregationMethod::MultiKrum {
             f: 1,
             requested_m: Some(3),
-            effective_m: 3,
+            effective_m: Some(3),
         }
     );
     assert_ne!(bare.method(), explicit.method());
+}
+
+#[test]
+fn effective_parameters_are_absent_when_no_method_ran() {
+    // A round that rejected everything resolved nothing, and the schema says so
+    // rather than reporting a value that was never applied.
+    let refused = parse(&entry_json(
+        r#"{"multi_krum":{"f":1,"requested_m":3,"effective_m":null}}"#,
+        &norm_rejected(0, None, 12.0, 1.0),
+        "all_updates_rejected",
+    ));
+
+    assert_eq!(
+        refused.method(),
+        &AuditedAggregationMethod::MultiKrum {
+            f: 1,
+            // What the caller asked for is known either way.
+            requested_m: Some(3),
+            effective_m: None,
+        }
+    );
+
+    // Both directions are refused at the public boundary.
+    assert!(
+        parse_result(&entry_json(
+            r#"{"multi_krum":{"f":1,"requested_m":null,"effective_m":3}}"#,
+            &norm_rejected(0, None, 12.0, 1.0),
+            "all_updates_rejected",
+        ))
+        .is_err(),
+        "an unrun method must not claim a resolved parameter"
+    );
+    assert!(
+        parse_result(&entry_json(
+            r#"{"multi_krum":{"f":1,"requested_m":null,"effective_m":null}}"#,
+            &accepted(0, None),
+            "aggregated",
+        ))
+        .is_err(),
+        "a method that ran must record what it ran with"
+    );
+
+    // Same configuration, the two outcomes, differing only in what actually ran.
+    let refused_trim = parse(&entry_json(
+        UNRUN_TRIM,
+        &norm_rejected(0, None, 12.0, 1.0),
+        "all_updates_rejected",
+    ));
+    assert_eq!(
+        refused_trim.method(),
+        &AuditedAggregationMethod::TrimmedMean {
+            configured_trim_fraction: 0.25,
+            effective_trim_fraction: None,
+            adaptive: false,
+        }
+    );
+
+    let applied_trim = parse(&entry_json(STATIC_TRIM, &accepted(0, None), "aggregated"));
+    assert_eq!(
+        applied_trim.method(),
+        &AuditedAggregationMethod::TrimmedMean {
+            configured_trim_fraction: 0.25,
+            effective_trim_fraction: Some(0.25),
+            adaptive: false,
+        }
+    );
 }
 
 #[test]

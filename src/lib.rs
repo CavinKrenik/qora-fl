@@ -20,11 +20,21 @@
 //! Use [`ByzantineAggregator`] for a convenient interface with built-in
 //! reputation tracking.
 //!
+//! ## Optional norm-bound filtering
+//!
+//! [`ByzantineAggregator::with_norm_bound_filter`] excludes updates whose L2
+//! norm exceeds a caller-chosen bound. It is **opt-in and off by default**: an
+//! aggregator that does not configure a bound computes no norms and behaves
+//! exactly as it did before the filter existed. A large norm is a policy
+//! violation rather than proof of malice, so an excluded client's reputation is
+//! left untouched.
+//!
 //! ## Audit schema
 //!
 //! [`audit`] defines an experimental, caller-owned record of what an
 //! aggregation attempt decided about each update. Qora-FL does not persist
-//! audit records, and the primary aggregation API does not yet return them.
+//! audit records; [`ByzantineAggregator::aggregate_with_audit`] returns one to
+//! the caller, who decides whether, where, and how to keep it.
 
 #![deny(missing_docs)]
 
@@ -48,7 +58,9 @@ pub use aggregators::aggregate_multi_krum_bfp16;
 pub use aggregators::fedavg;
 pub use aggregators::median;
 pub use aggregators::trimmed_mean;
-pub use aggregators::{AggregationMethod, ByzantineAggregator};
+pub use aggregators::{
+    AggregationMethod, AuditedAggregation, AuditedAggregationError, ByzantineAggregator,
+};
 pub use audit::{
     AggregationAuditDecision, AggregationAuditEntry, AggregationAuditOutcome, AggregationDecision,
     AggregationRejectionReason, AuditedAggregationMethod, AGGREGATION_AUDIT_SCHEMA_VERSION,
@@ -154,7 +166,14 @@ mod python {
     /// Byzantine-tolerant aggregator for federated learning model updates.
     ///
     /// Wraps Rust-backed aggregation algorithms (trimmed mean, median, fedavg)
-    /// with optional client reputation tracking.
+    /// with optional client reputation tracking and optional norm-bound
+    /// filtering.
+    ///
+    /// Audit records are deliberately not exposed here yet. The Rust
+    /// `aggregate_with_audit` returns a typed, versioned entry; mirroring that
+    /// as a hierarchy of Python classes would freeze a binding design while the
+    /// schema is still experimental. A later binding can return the serialized
+    /// shape as a dictionary instead.
     #[pyclass(name = "ByzantineAggregator")]
     struct PyByzantineAggregator {
         inner: crate::ByzantineAggregator,
@@ -163,12 +182,13 @@ mod python {
     #[pymethods]
     impl PyByzantineAggregator {
         #[new]
-        #[pyo3(signature = (method, trim_fraction, ban_threshold=0.0, adaptive_trim=false))]
+        #[pyo3(signature = (method, trim_fraction, ban_threshold=0.0, adaptive_trim=false, norm_bound=None))]
         fn new(
             method: String,
             trim_fraction: f32,
             ban_threshold: f32,
             adaptive_trim: bool,
+            norm_bound: Option<f32>,
         ) -> PyResult<Self> {
             let agg_method = parse_method(&method)?;
             // `> 0.0` is false for NaN, so an invalid threshold would take the
@@ -186,7 +206,20 @@ mod python {
                 crate::ByzantineAggregator::new(agg_method, trim_fraction)
             };
             inner.set_adaptive_trim(adaptive_trim);
+
+            // `None` leaves filtering off, which is the default and computes no
+            // norms at all. A supplied bound must be finite and > 0.
+            if let Some(bound) = norm_bound {
+                inner = inner.with_norm_bound_filter(bound).map_err(qora_err)?;
+            }
+
             Ok(Self { inner })
+        }
+
+        /// The configured norm bound, or None when filtering is disabled.
+        #[getter]
+        fn norm_bound(&self) -> Option<f32> {
+            self.inner.norm_bound()
         }
 
         /// Aggregate client model updates using the configured method.

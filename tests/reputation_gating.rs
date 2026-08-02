@@ -54,17 +54,38 @@ fn all_banned_clients_return_typed_error() {
     let updates = vec![array![[1.0]], array![[2.0]], array![[3.0]], array![[4.0]]];
 
     match agg.aggregate(&updates, Some(&ids(&["a", "b", "c", "d"]))) {
-        Err(QoraError::AllUpdatesRejected {
-            total,
-            rejected,
-            threshold,
-        }) => {
-            assert_eq!(total, 4, "total should count every submitted update");
-            assert_eq!(rejected, 4, "all four were below the threshold");
-            assert!((threshold - 0.5).abs() < 1e-6);
+        Err(QoraError::AllUpdatesRejected { submitted }) => {
+            assert_eq!(submitted, 4, "should count every submitted update");
         }
         other => panic!("expected AllUpdatesRejected, got {:?}", other),
     }
+}
+
+/// The error says nothing about *which* policy rejected the cohort.
+///
+/// It cannot: norm-bound filtering feeds the same variant, and a round can mix
+/// the two. The per-client reasons live in the audit record instead.
+#[test]
+fn the_error_does_not_claim_a_single_rejecting_policy() {
+    let mut agg = aggregator_with_scores(r#""FedAvg""#, 0.5, &[("a", 0.1), ("b", 0.1)]);
+    let updates = vec![array![[1.0]], array![[2.0]]];
+
+    let err = agg
+        .aggregate(&updates, Some(&ids(&["a", "b"])))
+        .expect_err("every client is below the threshold");
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains('2'),
+        "should name the submitted count: {}",
+        msg
+    );
+    assert!(
+        !msg.to_lowercase().contains("reputation"),
+        "the variant now covers norm filtering too, so it must not name one \
+         policy: {}",
+        msg
+    );
 }
 
 #[test]
@@ -245,19 +266,14 @@ fn default_constructor_never_gates() {
 // ===== Error message =====
 
 #[test]
-fn error_message_names_the_counts_and_threshold() {
-    let err = QoraError::AllUpdatesRejected {
-        total: 4,
-        rejected: 4,
-        threshold: 0.5,
-    };
+fn error_message_names_the_submitted_count() {
+    let err = QoraError::AllUpdatesRejected { submitted: 4 };
     let msg = err.to_string();
 
-    assert!(msg.contains('4'), "should name the counts: {}", msg);
-    assert!(msg.contains("0.5"), "should name the threshold: {}", msg);
+    assert!(msg.contains('4'), "should name the count: {}", msg);
     assert!(
-        msg.contains("reputation gating"),
-        "should attribute the rejection to gating: {}",
+        msg.contains("rejected"),
+        "should say what happened: {}",
         msg
     );
 }

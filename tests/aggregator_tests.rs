@@ -857,15 +857,7 @@ fn test_ban_gating_fails_closed_when_all_banned() {
     let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
 
     match agg.aggregate(&updates, Some(&ids)) {
-        Err(QoraError::AllUpdatesRejected {
-            total,
-            rejected,
-            threshold,
-        }) => {
-            assert_eq!(total, 3);
-            assert_eq!(rejected, 3);
-            assert!((threshold - 0.99).abs() < 1e-6);
-        }
+        Err(QoraError::AllUpdatesRejected { submitted }) => assert_eq!(submitted, 3),
         other => panic!("expected AllUpdatesRejected, got {:?}", other),
     }
 }

@@ -89,6 +89,11 @@ run the round ungated -- it returns `AllUpdatesRejected`. If every identified
 client falls below the threshold in a later round, the same error is returned
 rather than reinstating them.
 
+`AllUpdatesRejected` carries only the submitted count. It is raised by
+reputation gating, by norm-bound filtering, and by any mixture of the two, so it
+cannot name a single responsible policy. Use `aggregate_with_audit` when you
+need the per-client reasons.
+
 ### Sample weighting
 
 `num_examples` weighting applies to **FedAvg only**, through the Flower adapter
@@ -99,9 +104,52 @@ non-FedAvg method returns `WeightsNotSupported`.
 
 ### Norm-bound filtering
 
-`verification::check_norm_bound` exists and is tested, but **no aggregation
-path invokes it**. It is not a configurable filter today; integrating it is
-roadmap work. `filter_by_norm_bound` is deprecated.
+Excludes updates whose L2 norm exceeds a bound. **Opt-in and off by default**:
+without a configured bound, no norm is computed and behavior is unchanged.
+
+```rust
+ByzantineAggregator::new(method, trim_fraction).with_norm_bound_filter(bound)?
+```
+
+```python
+ByzantineAggregator(method, trim_fraction, norm_bound=bound)
+QoraStrategy(aggregation_method=method, norm_bound=bound)
+```
+
+**Choosing a bound.** There is no default worth having, and the library does not
+guess one. The right L2 bound depends on model scale, learning rate, local epoch
+count, and whether updates are deltas or full weights. Derive it from a few
+observed rounds of honest clients and set it with headroom -- a bound tighter
+than legitimate variation rejects honest work, which fails the round outright
+once it rejects everyone.
+
+| Setting | Behavior |
+|---|---|
+| unset (`None`) | No filtering, no norm computation. **Default.** |
+| Well above the honest maximum | Catches only extreme magnitude attacks |
+| Near the honest maximum | Tighter, with a real false-positive risk |
+| Below honest variation | Rejects honest clients; an all-rejected round fails |
+
+A bound must be finite and strictly positive. Zero, negative, NaN, and infinite
+bounds are rejected at construction and on deserialization, not clamped.
+
+What filtering does and does not do:
+
+- The norm is computed in `f64` and compared inclusively -- a norm exactly equal
+  to the bound participates.
+- A rejected update's client ID and FedAvg sample weight leave with it.
+- **Reputation is not affected.** A norm rejection is a participation decision,
+  not a verdict about the client. A large norm is a policy violation rather than
+  proof of malicious intent.
+- If nothing survives, the round returns `AllUpdatesRejected`.
+- Method quorum is evaluated after filtering, so a bound that removes clients can
+  push Krum or Multi-Krum below `n >= 2f + 3`, or push an explicit Multi-Krum `m`
+  above `n - 2f - 2`. Both are reported as their existing typed errors. Budget
+  for this when combining a tight bound with a large `f`.
+
+`verification::check_norm_bound` remains available as a standalone predicate and
+shares the same comparison. `filter_by_norm_bound` is deprecated and unused: it
+discards errors silently and cannot report per-update reasons.
 
 ### Trim fraction
 

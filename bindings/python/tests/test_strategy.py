@@ -413,7 +413,7 @@ class TestReputation:
         strat = strategy("fedavg", reputation_threshold=0.99)
         results = [result("a", [[1.0]]), result("b", [[3.0]])]
 
-        with pytest.raises(ValueError, match="reputation gating rejected all"):
+        with pytest.raises(ValueError, match="were rejected"):
             strat.aggregate_fit(1, results, [])
 
     def test_client_ids_stay_aligned_after_flattening(self):
@@ -548,3 +548,76 @@ class TestFlowerInterface:
         expected = list(inspect.signature(FedAvg.aggregate_fit).parameters)
         actual = list(inspect.signature(QoraStrategy.aggregate_fit).parameters)
         assert actual == expected
+
+
+# ===== Optional norm-bound filtering =====
+
+
+class TestNormBoundFiltering:
+    """The adapter never enables filtering on its own.
+
+    When it is configured, the bound reaches the one Rust aggregation call and
+    therefore applies to each client's complete flattened model -- not to
+    individual layers, which would judge an arbitrary slice of the model.
+    """
+
+    def test_disabled_unless_configured(self):
+        strat = strategy("fedavg")
+        assert strat.norm_bound is None
+        assert strat.aggregator.norm_bound is None
+
+        # A client with an enormous model still participates.
+        results = [result("a", [[1.0]]), result("huge", [[1000.0]])]
+        params, _ = strat.aggregate_fit(1, results, [])
+        assert layers_of(params)[0][0] > 100.0
+
+    def test_a_configured_bound_reaches_the_rust_aggregator(self):
+        strat = strategy("fedavg", norm_bound=10.0)
+        assert strat.aggregator.norm_bound == pytest.approx(10.0)
+
+    def test_an_unusable_bound_raises_at_construction(self):
+        for bad in (0.0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="[Nn]orm bound"):
+                strategy("fedavg", norm_bound=bad)
+
+    def test_a_multi_layer_model_is_judged_whole(self):
+        # Four layers of three 1.5s: each layer's norm is 2.598, under the 3.0
+        # bound, but the complete model's norm is 5.196, over it. Per-layer
+        # filtering would accept this client; whole-model filtering rejects it.
+        honest = [np.full(3, 0.1, dtype=np.float32) for _ in range(4)]
+        oversized = [np.full(3, 1.5, dtype=np.float32) for _ in range(4)]
+
+        strat = strategy("fedavg", norm_bound=3.0)
+        results = [
+            result("a", honest),
+            result("b", honest),
+            result("oversized", oversized),
+        ]
+
+        params, _ = strat.aggregate_fit(1, results, [])
+
+        for layer in layers_of(params):
+            np.testing.assert_allclose(layer, 0.1, atol=1e-5)
+
+    def test_an_excluded_client_keeps_its_reputation(self):
+        honest = [np.full(3, 0.1, dtype=np.float32)]
+        oversized = [np.full(3, 90.0, dtype=np.float32)]
+
+        strat = strategy("fedavg", norm_bound=3.0)
+        results = [
+            result("a", honest),
+            result("b", honest),
+            result("oversized", oversized),
+        ]
+        for round_number in range(1, 4):
+            strat.aggregate_fit(round_number, results, [])
+
+        assert strat.get_reputation("oversized") == pytest.approx(0.5)
+
+    def test_every_client_over_the_bound_refuses_the_round(self):
+        oversized = [np.full(3, 90.0, dtype=np.float32)]
+        strat = strategy("fedavg", norm_bound=1.0)
+        results = [result("a", oversized), result("b", oversized)]
+
+        with pytest.raises(ValueError, match="were rejected"):
+            strat.aggregate_fit(1, results, [])

@@ -232,10 +232,12 @@ class TestReputationGatingFailsClosed:
         agg = ByzantineAggregator("fedavg", 0.0, ban_threshold=0.99)
         updates = [np.array([[float(i)]], dtype=np.float32) for i in range(1, 4)]
 
-        with pytest.raises(ValueError, match="reputation gating rejected all updates"):
+        with pytest.raises(ValueError, match="were rejected"):
             agg.aggregate(updates, ["a", "b", "c"])
 
-    def test_error_names_counts_and_threshold(self):
+    def test_error_names_the_submitted_count(self):
+        # The message no longer names reputation: norm-bound filtering raises
+        # the same error, and a round can mix the two.
         agg = ByzantineAggregator("fedavg", 0.0, ban_threshold=0.99)
         updates = [np.array([[float(i)]], dtype=np.float32) for i in range(1, 4)]
 
@@ -243,8 +245,8 @@ class TestReputationGatingFailsClosed:
             agg.aggregate(updates, ["a", "b", "c"])
 
         message = str(excinfo.value)
-        assert "3 of 3" in message
-        assert "0.99" in message
+        assert "3" in message
+        assert "rejected" in message
 
     def test_without_client_ids_gating_does_not_apply(self):
         agg = ByzantineAggregator("fedavg", 0.0, ban_threshold=0.99)
@@ -277,6 +279,101 @@ class TestReputationGatingFailsClosed:
 
         with pytest.raises(ValueError, match="[Nn]on-finite"):
             agg.aggregate(updates, ["a", "b", "c"])
+
+
+# --- Optional norm-bound filtering ---
+
+
+def _u(*values):
+    return np.array([list(values)], dtype=np.float32)
+
+
+class TestNormBoundFiltering:
+    """Filtering is opt-in, validated, and fails closed.
+
+    A large norm is a policy violation, not proof of malice: an excluded client
+    is left out of the round and its reputation is untouched.
+    """
+
+    def test_disabled_by_default(self):
+        agg = ByzantineAggregator("fedavg", 0.0)
+        assert agg.norm_bound is None
+
+        # An update a bound would reject still participates.
+        result = agg.aggregate([_u(1.0), _u(1.0), _u(1000.0)])
+        assert result[0, 0] > 100.0
+
+    def test_explicit_none_is_disabled(self):
+        assert ByzantineAggregator("fedavg", 0.0, norm_bound=None).norm_bound is None
+
+    def test_a_valid_bound_is_readable(self):
+        agg = ByzantineAggregator("fedavg", 0.0, norm_bound=12.5)
+        assert agg.norm_bound == pytest.approx(12.5)
+
+    @pytest.mark.parametrize(
+        "bad", [0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+    )
+    def test_an_unusable_bound_raises(self, bad):
+        with pytest.raises(ValueError, match="[Nn]orm bound"):
+            ByzantineAggregator("fedavg", 0.0, norm_bound=bad)
+
+    def test_an_over_bound_update_is_excluded(self):
+        agg = ByzantineAggregator("fedavg", 0.0, norm_bound=10.0)
+        result = agg.aggregate([_u(1.0), _u(3.0), _u(1000.0)])
+        assert result[0, 0] == pytest.approx(2.0, abs=1e-6)
+
+    def test_the_boundary_is_inclusive(self):
+        # Norm exactly 5.0 against a bound of 5.0 participates.
+        agg = ByzantineAggregator("fedavg", 0.0, norm_bound=5.0)
+        result = agg.aggregate([_u(3.0, 4.0), _u(3.0, 0.0)])
+        assert result[0, 1] == pytest.approx(2.0, abs=1e-6)
+
+    def test_all_updates_over_the_bound_raise(self):
+        agg = ByzantineAggregator("fedavg", 0.0, norm_bound=1.0)
+        with pytest.raises(ValueError, match="were rejected"):
+            agg.aggregate([_u(100.0), _u(200.0)])
+
+    def test_malformed_input_outranks_the_filter(self):
+        agg = ByzantineAggregator("fedavg", 0.0, norm_bound=1.0)
+        with pytest.raises(ValueError, match="[Nn]on-finite"):
+            agg.aggregate([_u(0.5), _u(float("nan"))])
+
+    def test_sample_weights_leave_with_their_client(self):
+        # A: 0, weight 1, accepted. B: 1000, weight 100, rejected.
+        # C: 10, weight 9, accepted. Expected (0*1 + 10*9) / 10 = 9.0.
+        agg = ByzantineAggregator("fedavg", 0.0, norm_bound=100.0)
+        result = agg.aggregate(
+            [_u(0.0), _u(1000.0), _u(10.0)],
+            ["a", "b", "c"],
+            [1.0, 100.0, 9.0],
+        )
+        assert result[0, 0] == pytest.approx(9.0, abs=1e-4)
+
+    def test_an_excluded_client_keeps_its_reputation(self):
+        agg = ByzantineAggregator("fedavg", 0.0, norm_bound=10.0)
+        updates = [_u(1.0), _u(1.0), _u(5000.0)]
+        for _ in range(3):
+            agg.aggregate(updates, ["a", "b", "oversized"])
+
+        assert agg.get_reputation("oversized") == pytest.approx(0.5)
+
+    def test_the_bound_survives_a_json_round_trip(self):
+        agg = ByzantineAggregator("fedavg", 0.0, norm_bound=7.5)
+        restored = ByzantineAggregator.from_json(agg.to_json())
+        assert restored.norm_bound == pytest.approx(7.5)
+
+    def test_a_configuration_without_the_field_restores_disabled(self):
+        # What 0.3.1 wrote, before the field existed.
+        legacy = json.dumps(
+            {
+                "method": "FedAvg",
+                "trim_fraction": 0.0,
+                "reputation": {},
+                "ban_threshold": 0.0,
+                "adaptive_trim": False,
+            }
+        )
+        assert ByzantineAggregator.from_json(legacy).norm_bound is None
 
 
 # --- Reputation numeric safety ---

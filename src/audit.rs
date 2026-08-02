@@ -6,19 +6,25 @@
 //!
 //! # Status
 //!
-//! **Experimental, and not yet produced by any aggregation path.**
-//! [`crate::ByzantineAggregator::aggregate`] does not return audit entries;
-//! wiring them in is future work. This module defines the shape so that the
-//! serialized contract can be reviewed on its own, before behavior depends on
-//! it.
+//! **Experimental.** Produced by
+//! [`crate::ByzantineAggregator::aggregate_with_audit`] and its weighted
+//! counterpart; the ordinary [`crate::ByzantineAggregator::aggregate`] returns
+//! only the aggregate. Wire stability is not promised.
+//!
+//! Schema version 1 describes two outcomes: a round that aggregated, and a
+//! round where filtering rejected everything. A method-precondition failure
+//! after some candidates survived -- Krum quorum, Multi-Krum selection -- is
+//! neither, so no entry is produced for it. See
+//! [`crate::AuditedAggregationError`].
 //!
 //! # Caller-owned
 //!
 //! Qora-FL describes what happened; the caller decides whether, where, and how
 //! to store it. The library does not write files, keep a log, emit telemetry,
 //! choose a retention policy, or retain entries inside
-//! [`crate::ByzantineAggregator`]. An entry derives `Serialize`/`Deserialize`
-//! and nothing more.
+//! [`crate::ByzantineAggregator`] -- an entry is handed over once and forgotten,
+//! so the serialized aggregator does not grow with the round count. An entry
+//! derives `Serialize`/`Deserialize` and nothing more.
 //!
 //! This is deliberate. An audit log embedded in the aggregator would grow
 //! without bound in the number of rounds and would be dragged into every
@@ -121,10 +127,15 @@ pub enum AuditedAggregationMethod {
     TrimmedMean {
         /// The fraction the aggregator was constructed with.
         configured_trim_fraction: f32,
-        /// The fraction actually applied this round.
+        /// The fraction actually applied this round, or `None` if no
+        /// aggregation ran.
         ///
-        /// Equal to `configured_trim_fraction` unless `adaptive` is true.
-        effective_trim_fraction: f32,
+        /// `Some` exactly when the outcome is
+        /// [`AggregationAuditOutcome::Aggregated`]; equal to
+        /// `configured_trim_fraction` unless `adaptive` is true. A round that
+        /// rejected every update applied no fraction at all, and reporting the
+        /// configured one there would name a parameter that never executed.
+        effective_trim_fraction: Option<f32>,
         /// Whether the effective fraction was computed from reputation.
         adaptive: bool,
     },
@@ -139,8 +150,15 @@ pub enum AuditedAggregationMethod {
         f: usize,
         /// The `m` the caller asked for, or `None` for the bare form.
         requested_m: Option<usize>,
-        /// The number of vectors actually selected and averaged.
-        effective_m: usize,
+        /// The number of vectors actually selected and averaged, or `None` if
+        /// no aggregation ran.
+        ///
+        /// `Some` exactly when the outcome is
+        /// [`AggregationAuditOutcome::Aggregated`]. A bare request resolves `m`
+        /// against the accepted cohort, so a round that accepted nothing has no
+        /// value to resolve -- not even the uncapped default, which would claim
+        /// a selection count that was never applied.
+        effective_m: Option<usize>,
     },
 }
 
@@ -288,6 +306,24 @@ pub enum AggregationAuditOutcome {
 ///   equals it -- an explicit request is honored exactly or refused, never
 ///   silently resolved to something else.
 ///
+/// # Effective parameters and the outcome agree
+///
+/// The runtime-resolved parameters -- `effective_trim_fraction` and
+/// `effective_m` -- are `Some` **exactly when** the outcome is
+/// [`AggregationAuditOutcome::Aggregated`], and this is enforced in both
+/// directions:
+///
+/// * An aggregated round carrying `None` is rejected: something ran, so the
+///   parameter it ran with exists and must be recorded.
+/// * A round that aggregated nothing carrying `Some` is rejected: no method
+///   executed, so any value there would be invented. This matters most for a
+///   bare Multi-Krum, whose `m` resolves against the accepted cohort -- with an
+///   empty cohort there is nothing to resolve, and reporting the uncapped
+///   default would name a selection count that was never applied.
+///
+/// `requested_m` is unconstrained by the outcome: what the caller asked for is
+/// known regardless of whether anything ran.
+///
 /// `effective_m` is deliberately **not** checked against the accepted cohort
 /// size: the entry does not know `n` at the moment parameters were resolved,
 /// so that relationship belongs to the integration that builds the record.
@@ -328,9 +364,11 @@ impl TryFrom<AuditEntryRepr> for AggregationAuditEntry {
 impl AggregationAuditEntry {
     /// Build a validated entry, stamped with the current schema version.
     ///
-    /// Crate-visible: entries describe what an aggregation path decided, and
-    /// no such path produces them yet. External code obtains entries by
-    /// deserializing them, which enforces the same invariants.
+    /// Crate-visible: an entry describes what an aggregation path decided, so
+    /// only an aggregation path is in a position to write one truthfully.
+    /// External code obtains entries from
+    /// [`crate::ByzantineAggregator::aggregate_with_audit`] or by deserializing
+    /// them, which enforces the same invariants.
     ///
     /// # Errors
     ///
@@ -343,7 +381,7 @@ impl AggregationAuditEntry {
     ) -> Result<Self, QoraError> {
         let invalid = |reason: String| QoraError::InvalidAuditEntry { reason };
 
-        validate_method(&method).map_err(invalid)?;
+        validate_method(&method, &outcome).map_err(invalid)?;
 
         if decisions.is_empty() {
             return Err(invalid("an audit entry needs at least one decision".into()));
@@ -449,10 +487,44 @@ impl AggregationAuditEntry {
 }
 
 /// Check the parameters carried by an effective-method descriptor.
-fn validate_method(method: &AuditedAggregationMethod) -> Result<(), String> {
+///
+/// The outcome is a parameter because two of the checks depend on it: a
+/// runtime-resolved value must be present exactly when a method executed. See
+/// the invariants on [`AggregationAuditEntry`].
+fn validate_method(
+    method: &AuditedAggregationMethod,
+    outcome: &AggregationAuditOutcome,
+) -> Result<(), String> {
     // `2f + 3` is the Krum quorum requirement; an `f` that overflows it cannot
     // describe a real configuration.
     let representable = |f: usize| f.checked_mul(2).and_then(|x| x.checked_add(3)).is_some();
+
+    // Any outcome other than `Aggregated` means no method ran, so there is no
+    // effective parameter to report. Written as a positive test rather than a
+    // match on the negative cases so that a future outcome variant defaults to
+    // "did not execute" rather than silently permitting invented values.
+    let executed = matches!(outcome, AggregationAuditOutcome::Aggregated);
+
+    /// Require a runtime-resolved value to be present exactly when one exists.
+    fn resolved<'a, T>(
+        label: &str,
+        value: &'a Option<T>,
+        executed: bool,
+    ) -> Result<Option<&'a T>, String> {
+        match (executed, value) {
+            (true, None) => Err(format!(
+                "outcome is Aggregated but no {} was recorded; a method that ran \
+                 ran with some value",
+                label
+            )),
+            (false, Some(_)) => Err(format!(
+                "no aggregation ran, so there is no {} to record; a value here \
+                 would name a parameter that never executed",
+                label
+            )),
+            (_, other) => Ok(other.as_ref()),
+        }
+    }
 
     match method {
         AuditedAggregationMethod::FedAvg | AuditedAggregationMethod::Median => Ok(()),
@@ -462,10 +534,15 @@ fn validate_method(method: &AuditedAggregationMethod) -> Result<(), String> {
             effective_trim_fraction,
             adaptive,
         } => {
-            for (label, value) in [
-                ("configured", configured_trim_fraction),
-                ("effective", effective_trim_fraction),
-            ] {
+            let effective = resolved("effective trim fraction", effective_trim_fraction, executed)?;
+
+            // The configured fraction is known regardless of what ran, so it is
+            // always checked; the effective one only when it exists.
+            for (label, value) in [("configured", Some(configured_trim_fraction))]
+                .into_iter()
+                .chain([("effective", effective)])
+            {
+                let Some(value) = value else { continue };
                 if !value.is_finite() || !(0.0..=MAX_TRIM_FRACTION).contains(value) {
                     return Err(format!(
                         "{} trim fraction {} is not a finite value in [0, {}]",
@@ -473,11 +550,14 @@ fn validate_method(method: &AuditedAggregationMethod) -> Result<(), String> {
                     ));
                 }
             }
-            if !adaptive && configured_trim_fraction != effective_trim_fraction {
-                return Err(format!(
-                    "non-adaptive trimmed mean must apply its configured fraction,                      but configured {} != effective {}",
-                    configured_trim_fraction, effective_trim_fraction
-                ));
+
+            if let Some(effective) = effective {
+                if !adaptive && configured_trim_fraction != effective {
+                    return Err(format!(
+                        "non-adaptive trimmed mean must apply its configured fraction,                          but configured {} != effective {}",
+                        configured_trim_fraction, effective
+                    ));
+                }
             }
             Ok(())
         }
@@ -500,14 +580,21 @@ fn validate_method(method: &AuditedAggregationMethod) -> Result<(), String> {
                     f
                 ));
             }
-            if *effective_m < 1 {
+
+            // `requested_m` is deliberately not tied to the outcome: what the
+            // caller asked for is known whether or not anything ran.
+            let Some(effective) = resolved("effective Multi-Krum m", effective_m, executed)? else {
+                return Ok(());
+            };
+
+            if *effective < 1 {
                 return Err("Multi-Krum must select at least one vector".to_string());
             }
             if let Some(requested) = requested_m {
-                if requested != effective_m {
+                if requested != effective {
                     return Err(format!(
                         "explicit Multi-Krum m {} was recorded as effective {};                          an explicit request is honored exactly or refused",
-                        requested, effective_m
+                        requested, effective
                     ));
                 }
             }
@@ -547,12 +634,30 @@ fn validate_reason(reason: &AggregationRejectionReason) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// Static trimmed mean: configured and effective fractions agree.
+    /// Static trimmed mean that ran: configured and effective fractions agree.
     fn static_trim() -> AuditedAggregationMethod {
         AuditedAggregationMethod::TrimmedMean {
             configured_trim_fraction: 0.25,
-            effective_trim_fraction: 0.25,
+            effective_trim_fraction: Some(0.25),
             adaptive: false,
+        }
+    }
+
+    /// The same configuration for a round that aggregated nothing.
+    fn unrun_trim() -> AuditedAggregationMethod {
+        AuditedAggregationMethod::TrimmedMean {
+            configured_trim_fraction: 0.25,
+            effective_trim_fraction: None,
+            adaptive: false,
+        }
+    }
+
+    /// Multi-Krum for a round that aggregated nothing.
+    fn unrun_multi_krum(requested_m: Option<usize>) -> AuditedAggregationMethod {
+        AuditedAggregationMethod::MultiKrum {
+            f: 1,
+            requested_m,
+            effective_m: None,
         }
     }
 
@@ -803,7 +908,7 @@ mod tests {
                 effective_trim_fraction,
                 adaptive,
             } => {
-                assert_eq!(configured_trim_fraction, effective_trim_fraction);
+                assert_eq!(*effective_trim_fraction, Some(*configured_trim_fraction));
                 assert!(!adaptive);
             }
             other => panic!("expected trimmed mean, got {:?}", other),
@@ -817,7 +922,7 @@ mod tests {
         let entry = AggregationAuditEntry::new(
             AuditedAggregationMethod::TrimmedMean {
                 configured_trim_fraction: 0.125,
-                effective_trim_fraction: 0.375,
+                effective_trim_fraction: Some(0.375),
                 adaptive: true,
             },
             vec![accepted(0, "a")],
@@ -832,7 +937,7 @@ mod tests {
                 adaptive,
             } => {
                 assert_eq!(*configured_trim_fraction, 0.125);
-                assert_eq!(*effective_trim_fraction, 0.375);
+                assert_eq!(*effective_trim_fraction, Some(0.375));
                 assert!(adaptive);
             }
             other => panic!("expected trimmed mean, got {:?}", other),
@@ -844,7 +949,7 @@ mod tests {
         assert!(AggregationAuditEntry::new(
             AuditedAggregationMethod::TrimmedMean {
                 configured_trim_fraction: 0.1,
-                effective_trim_fraction: 0.4,
+                effective_trim_fraction: Some(0.4),
                 adaptive: false,
             },
             vec![accepted(0, "a")],
@@ -866,7 +971,7 @@ mod tests {
                 AggregationAuditEntry::new(
                     AuditedAggregationMethod::TrimmedMean {
                         configured_trim_fraction: configured,
-                        effective_trim_fraction: effective,
+                        effective_trim_fraction: Some(effective),
                         adaptive: true,
                     },
                     vec![accepted(0, "a")],
@@ -876,6 +981,29 @@ mod tests {
                 "configured={} effective={} must be rejected",
                 configured,
                 effective
+            );
+        }
+    }
+
+    /// A configured fraction is checked even when nothing ran.
+    ///
+    /// It describes the aggregator, not the round, so it is known either way.
+    #[test]
+    fn a_refused_round_still_range_checks_its_configured_fraction() {
+        for configured in [f32::NAN, f32::INFINITY, -0.1, 0.6] {
+            assert!(
+                AggregationAuditEntry::new(
+                    AuditedAggregationMethod::TrimmedMean {
+                        configured_trim_fraction: configured,
+                        effective_trim_fraction: None,
+                        adaptive: false,
+                    },
+                    vec![rep_rejected(0, "a")],
+                    AggregationAuditOutcome::AllUpdatesRejected,
+                )
+                .is_err(),
+                "configured={} must be rejected",
+                configured
             );
         }
     }
@@ -898,7 +1026,7 @@ mod tests {
             AuditedAggregationMethod::MultiKrum {
                 f: usize::MAX,
                 requested_m: None,
-                effective_m: 1,
+                effective_m: Some(1),
             },
         ] {
             assert!(AggregationAuditEntry::new(
@@ -918,7 +1046,7 @@ mod tests {
             AuditedAggregationMethod::MultiKrum {
                 f: 1,
                 requested_m: None,
-                effective_m: 2,
+                effective_m: Some(2),
             },
             vec![accepted(0, "a")],
             AggregationAuditOutcome::Aggregated,
@@ -932,7 +1060,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*requested_m, None);
-                assert_eq!(*effective_m, 2);
+                assert_eq!(*effective_m, Some(2));
             }
             other => panic!("expected multi-krum, got {:?}", other),
         }
@@ -947,7 +1075,7 @@ mod tests {
             AuditedAggregationMethod::MultiKrum {
                 f: 1,
                 requested_m: Some(3),
-                effective_m: 1,
+                effective_m: Some(1),
             },
             vec![accepted(0, "a")],
             AggregationAuditOutcome::Aggregated,
@@ -958,7 +1086,7 @@ mod tests {
             AuditedAggregationMethod::MultiKrum {
                 f: 1,
                 requested_m: Some(3),
-                effective_m: 3,
+                effective_m: Some(3),
             },
             vec![accepted(0, "a")],
             AggregationAuditOutcome::Aggregated,
@@ -972,7 +1100,7 @@ mod tests {
             AuditedAggregationMethod::MultiKrum {
                 f: 1,
                 requested_m: None,
-                effective_m: 0,
+                effective_m: Some(0),
             },
             vec![accepted(0, "a")],
             AggregationAuditOutcome::Aggregated,
@@ -1038,7 +1166,7 @@ mod tests {
             name(AuditedAggregationMethod::MultiKrum {
                 f: 1,
                 requested_m: None,
-                effective_m: 1,
+                effective_m: Some(1),
             }),
             "multi_krum"
         );
@@ -1055,7 +1183,7 @@ mod tests {
             // Adaptive: the two fractions differ, and both must survive.
             AuditedAggregationMethod::TrimmedMean {
                 configured_trim_fraction: 0.125,
-                effective_trim_fraction: 0.375,
+                effective_trim_fraction: Some(0.375),
                 adaptive: true,
             },
             AuditedAggregationMethod::Krum { f: 2 },
@@ -1064,12 +1192,12 @@ mod tests {
             AuditedAggregationMethod::MultiKrum {
                 f: 1,
                 requested_m: None,
-                effective_m: 2,
+                effective_m: Some(2),
             },
             AuditedAggregationMethod::MultiKrum {
                 f: 1,
                 requested_m: Some(3),
-                effective_m: 3,
+                effective_m: Some(3),
             },
         ] {
             let entry = AggregationAuditEntry::new(
@@ -1201,12 +1329,10 @@ mod tests {
 
     #[test]
     fn norm_rejection_shape_matches_the_documented_fixture() {
+        // A refused round: `requested_m` is what the caller asked for, and
+        // `effective_m` is null because nothing was selected.
         let entry = AggregationAuditEntry::new(
-            AuditedAggregationMethod::MultiKrum {
-                f: 1,
-                requested_m: Some(3),
-                effective_m: 3,
-            },
+            unrun_multi_krum(Some(3)),
             vec![norm_rejected(0, None)],
             AggregationAuditOutcome::AllUpdatesRejected,
         )
@@ -1216,7 +1342,7 @@ mod tests {
         assert_eq!(
             value["method"],
             serde_json::json!({
-                "multi_krum": { "f": 1, "requested_m": 3, "effective_m": 3 }
+                "multi_krum": { "f": 1, "requested_m": 3, "effective_m": null }
             })
         );
         assert_eq!(value["outcome"], "all_updates_rejected");
@@ -1224,6 +1350,165 @@ mod tests {
             value["decisions"][0]["decision"]["rejected"]["norm_bound_exceeded"]["bound"],
             serde_json::json!(10.0)
         );
+    }
+
+    // ===== Effective values track the outcome =====
+
+    #[test]
+    fn a_refused_round_records_no_effective_parameters() {
+        for method in [
+            unrun_trim(),
+            unrun_multi_krum(None),
+            unrun_multi_krum(Some(3)),
+        ] {
+            let entry = AggregationAuditEntry::new(
+                method.clone(),
+                vec![rep_rejected(0, "a")],
+                AggregationAuditOutcome::AllUpdatesRejected,
+            )
+            .unwrap_or_else(|e| panic!("{:?} must be valid when nothing ran: {}", method, e));
+
+            match entry.method() {
+                AuditedAggregationMethod::TrimmedMean {
+                    effective_trim_fraction,
+                    ..
+                } => assert_eq!(*effective_trim_fraction, None),
+                AuditedAggregationMethod::MultiKrum { effective_m, .. } => {
+                    assert_eq!(*effective_m, None)
+                }
+                other => panic!("unexpected method {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_round_may_not_invent_an_effective_parameter() {
+        // The failure this rule exists for: a bare Multi-Krum resolves `m`
+        // against the accepted cohort, so an empty cohort has nothing to
+        // resolve. Reporting the uncapped default would name a selection count
+        // that was never applied.
+        assert!(
+            AggregationAuditEntry::new(
+                AuditedAggregationMethod::MultiKrum {
+                    f: 1,
+                    requested_m: None,
+                    effective_m: Some(3),
+                },
+                vec![rep_rejected(0, "a")],
+                AggregationAuditOutcome::AllUpdatesRejected,
+            )
+            .is_err(),
+            "an unrun bare Multi-Krum must not claim a resolved m"
+        );
+
+        // Same for an explicit request: asking for 3 does not mean 3 ran.
+        assert!(AggregationAuditEntry::new(
+            AuditedAggregationMethod::MultiKrum {
+                f: 1,
+                requested_m: Some(3),
+                effective_m: Some(3),
+            },
+            vec![rep_rejected(0, "a")],
+            AggregationAuditOutcome::AllUpdatesRejected,
+        )
+        .is_err());
+
+        // And for the trim fraction, including the case where the effective
+        // value merely repeats the configured one.
+        assert!(AggregationAuditEntry::new(
+            AuditedAggregationMethod::TrimmedMean {
+                configured_trim_fraction: 0.25,
+                effective_trim_fraction: Some(0.25),
+                adaptive: false,
+            },
+            vec![rep_rejected(0, "a")],
+            AggregationAuditOutcome::AllUpdatesRejected,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_aggregated_round_must_record_its_effective_parameters() {
+        // The other direction: something ran, so the parameter it ran with
+        // exists and omitting it loses the one thing the descriptor is for.
+        assert!(
+            AggregationAuditEntry::new(
+                unrun_trim(),
+                vec![accepted(0, "a")],
+                AggregationAuditOutcome::Aggregated,
+            )
+            .is_err(),
+            "an aggregated trimmed mean applied some fraction"
+        );
+
+        for requested_m in [None, Some(3)] {
+            assert!(
+                AggregationAuditEntry::new(
+                    unrun_multi_krum(requested_m),
+                    vec![accepted(0, "a")],
+                    AggregationAuditOutcome::Aggregated,
+                )
+                .is_err(),
+                "an aggregated Multi-Krum selected some number of vectors \
+                 (requested_m={:?})",
+                requested_m
+            );
+        }
+    }
+
+    #[test]
+    fn methods_without_resolved_parameters_are_unaffected_by_the_outcome() {
+        for method in [
+            AuditedAggregationMethod::FedAvg,
+            AuditedAggregationMethod::Median,
+            AuditedAggregationMethod::Krum { f: 1 },
+        ] {
+            assert!(AggregationAuditEntry::new(
+                method.clone(),
+                vec![accepted(0, "a")],
+                AggregationAuditOutcome::Aggregated,
+            )
+            .is_ok());
+
+            assert!(AggregationAuditEntry::new(
+                method,
+                vec![rep_rejected(0, "a")],
+                AggregationAuditOutcome::AllUpdatesRejected,
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn deserialization_enforces_the_outcome_rules() {
+        // Aggregated with a null effective_m.
+        let json = r#"{
+            "schema_version": 1,
+            "method": {"multi_krum": {"f": 1, "requested_m": null, "effective_m": null}},
+            "decisions": [{"update_index": 0, "client_id": null, "decision": "accepted"}],
+            "outcome": "aggregated"
+        }"#;
+        assert!(serde_json::from_str::<AggregationAuditEntry>(json).is_err());
+
+        // All-rejected with an invented effective_m.
+        let json = r#"{
+            "schema_version": 1,
+            "method": {"multi_krum": {"f": 1, "requested_m": null, "effective_m": 3}},
+            "decisions": [{"update_index": 0, "client_id": null,
+                "decision": {"rejected": {"norm_bound_exceeded": {"norm": 5.0, "bound": 1.0}}}}],
+            "outcome": "all_updates_rejected"
+        }"#;
+        assert!(serde_json::from_str::<AggregationAuditEntry>(json).is_err());
+
+        // All-rejected with a null effective_m: the honest record.
+        let json = r#"{
+            "schema_version": 1,
+            "method": {"multi_krum": {"f": 1, "requested_m": 2, "effective_m": null}},
+            "decisions": [{"update_index": 0, "client_id": null,
+                "decision": {"rejected": {"norm_bound_exceeded": {"norm": 5.0, "bound": 1.0}}}}],
+            "outcome": "all_updates_rejected"
+        }"#;
+        assert!(serde_json::from_str::<AggregationAuditEntry>(json).is_ok());
     }
 
     // ===== Deserialization enforces the same invariants =====

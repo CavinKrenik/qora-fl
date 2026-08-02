@@ -35,7 +35,9 @@ Behavior available through tested public paths:
 - Krum quorum enforcement (`n >= 2f + 3`)
 - Multi-Krum selection-bound enforcement (`1 <= m <= n - 2f - 2`)
 - Reputation tracking and participation gating
-- Fail-closed behavior when gating rejects every client
+- Optional norm-bound filtering, opt-in and off by default
+- Fail-closed behavior when filtering rejects every client
+- Caller-owned audit records of each round's per-update decisions
 - Reputation numeric invariants (scores finite and within `[0, 1]`)
 - Rust API and Python bindings
 - Flower-compatible strategy adapter
@@ -48,8 +50,11 @@ not yet implemented:
 
 - Reputation-weighted robust aggregation (cubic influence weighting exists as a
   utility only)
-- Optional norm-bound filtering during aggregation
-- Broader audit records
+- Adaptive or percentile-derived norm bounds (today the caller picks a fixed
+  bound)
+- Audit outcomes for method-precondition failures (schema version 1 covers
+  successful aggregation and all-rejected filtering only)
+- Audit records exposed to Python
 - Cross-platform bit-identical end-to-end aggregation
 - Independent security review
 - Real-world deployment validation
@@ -128,6 +133,10 @@ a client's update sits from the aggregate that round.
 - **Maintains numeric invariants**: scores are finite and within `[0, 1]`, and
   invalid mutation inputs are rejected rather than clamped
 
+Norm-bound filtering does **not** feed reputation. A client excluded by the
+bound is left out of the round and its score is untouched, in either direction;
+see [Norm-bound filtering](#norm-bound-filtering).
+
 **What it does not do yet:** cubic influence weighting (`min(rep^3, 0.8)`) and
 its cap are available as utilities, and a caller may use those values directly.
 The primary aggregation path does not currently consume them, so the cap does
@@ -191,6 +200,95 @@ What the adapter does:
   Reputation is available through `QoraStrategy.get_reputation`.
 - Performs no gating of its own; reputation gating and updates happen once, in
   the Rust aggregator.
+- Enables norm-bound filtering only when `norm_bound` is passed. The bound then
+  applies to each client's complete flattened model, not to individual layers.
+
+## Norm-bound filtering
+
+**Opt-in, and off by default.** An aggregator that does not configure a bound
+computes no norms and behaves exactly as it did before the filter existed.
+
+```rust
+use qora_fl::ByzantineAggregator;
+use qora_fl::aggregators::AggregationMethod;
+
+// The bound must be finite and > 0, or this returns InvalidNormBound.
+let mut agg = ByzantineAggregator::new(AggregationMethod::Median, 0.0)
+    .with_norm_bound_filter(10.0)?;
+```
+
+```python
+from qora import ByzantineAggregator
+
+agg = ByzantineAggregator("median", 0.0, norm_bound=10.0)
+```
+
+How it behaves:
+
+- The caller picks the bound. There is no defensible default: the right L2
+  bound depends on model scale, learning rate, local epoch count, and whether
+  updates are deltas or full weights -- none of which the crate observes.
+- A bound must be **finite and strictly positive**. Zero, negative, NaN, and
+  infinite bounds are rejected rather than clamped.
+- The norm is computed in **`f64`**, so the comparison is exact across the full
+  `f32` range rather than overflowing at ~3.4e38 or flushing to zero below
+  ~1.4e-45.
+- **Equality is acceptance**: a norm exactly equal to the bound participates.
+- A rejected update takes its client ID and its FedAvg sample weight with it, so
+  a rejected weight never reaches the numerator or the denominator.
+- **A rejected update does not affect reputation** -- not a reward, not a
+  penalty, not a ban. A large norm is a policy violation, not proof of malicious
+  intent, and this filter does not claim to detect Byzantine behavior.
+- **All rejected fails closed**: `AllUpdatesRejected`, never a partial or
+  best-effort aggregate.
+- Method quorum is evaluated **after** filtering, against the accepted cohort.
+  Filtering can therefore shrink a valid cohort into one Krum or Multi-Krum
+  refuses; that is reported rather than repaired by reinstating clients or
+  weakening `f`.
+
+Order within a round: validate the whole batch → reputation gating → norm
+filtering → fail closed if nothing remains → resolve effective method
+parameters → enforce method preconditions → aggregate → update reputation for
+accepted clients. Malformed input is always an error rather than a filtering
+decision, and a client rejected by reputation is never measured again by the
+norm filter.
+
+`verification::check_norm_bound` remains available as a standalone predicate and
+shares this comparison. `verification::filter_by_norm_bound` is deprecated and
+is **not** used by the aggregation path: it discards errors silently and cannot
+produce per-update reasons.
+
+## Audit records
+
+`ByzantineAggregator::aggregate_with_audit` returns the aggregate plus an
+`AggregationAuditEntry`: one decision per submitted update, at its original
+index, with a typed reason for each rejection and the **effective** method
+parameters that actually ran.
+
+Records are **caller-owned**. Qora-FL does not persist them, does not keep a
+log, and stores nothing inside the aggregator -- an entry is handed over once
+and forgotten, so the serialized aggregator does not grow with the round count.
+
+```rust
+use qora_fl::ByzantineAggregator;
+use qora_fl::aggregators::AggregationMethod;
+use ndarray::array;
+
+let mut agg = ByzantineAggregator::new(AggregationMethod::Median, 0.0)
+    .with_norm_bound_filter(10.0)?;
+
+let updates = vec![array![[1.0]], array![[500.0]], array![[2.0]]];
+let round = agg.aggregate_with_audit(&updates, None)?;
+
+assert_eq!(round.audit().rejected_count(), 1);
+```
+
+Ordinary `aggregate` returns only the aggregate or only the error. The audited
+API additionally preserves the decisions across the all-rejected failure, which
+is the round they matter most for. Schema version 1 has two outcomes --
+aggregated, and all updates rejected -- so a method-precondition failure after
+some candidates survived returns the typed error with no record rather than one
+that would describe something that did not happen.
 
 ## Python (Standalone)
 
@@ -404,7 +502,9 @@ Qora-FL, and none of the evidence in this repository is inherited from it.
 ## Roadmap
 
 - Reputation-weighted robust aggregation
-- Norm-bound verification as an opt-in pre-aggregation filter
+- Adaptive or percentile-derived norm bounds
+- Audit records exposed to Python, and an audit outcome for method-precondition
+  failures
 - TensorFlow Federated adapter
 - Formal verification experiments for the integer scoring path
 

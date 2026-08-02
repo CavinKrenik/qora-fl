@@ -35,7 +35,8 @@ Behavior available through tested public paths:
 - Krum quorum enforcement (`n >= 2f + 3`)
 - Multi-Krum selection-bound enforcement (`1 <= m <= n - 2f - 2`)
 - Reputation tracking and participation gating
-- Fail-closed behavior when gating rejects every client
+- Optional norm-bound filtering, opt-in and off by default
+- Fail-closed behavior when filtering rejects every client
 - Reputation numeric invariants (scores finite and within `[0, 1]`)
 - Rust API and Python bindings
 - Flower-compatible strategy adapter
@@ -48,8 +49,11 @@ not yet implemented:
 
 - Reputation-weighted robust aggregation (cubic influence weighting exists as a
   utility only)
-- Optional norm-bound filtering during aggregation
-- Broader audit records
+- Adaptive or percentile-derived norm bounds (today the caller picks a fixed
+  bound)
+- Audit records in Python. The Rust API returns a typed, versioned record from
+  `aggregate_with_audit`; the bindings do not expose it yet, so that a binding
+  design is not frozen while the schema is still experimental.
 - Cross-platform bit-identical end-to-end aggregation
 - Independent security review
 - Real-world deployment validation
@@ -141,6 +145,9 @@ a client's update sits from the aggregate that round.
 - **Maintains numeric invariants**: scores are finite and within `[0, 1]`, and
   invalid mutation inputs are rejected rather than clamped
 
+Norm-bound filtering does **not** feed reputation: a client excluded by the
+bound is left out of the round and its score is untouched.
+
 **What it does not do yet:** cubic influence weighting (`min(rep^3, 0.8)`) and
 its cap are available as utilities, and a caller may use those values directly.
 The primary aggregation path does not currently consume them, so the cap does
@@ -202,6 +209,38 @@ updates += [np.array([[100.0, 200.0]], dtype=np.float32) for _ in range(3)]
 result = agg.aggregate(updates)
 # Result is [1.0, 2.0] -- attackers rejected
 ```
+
+### Norm-bound filtering
+
+**Opt-in, and off by default.** Without `norm_bound`, no norm is computed and
+behavior is unchanged.
+
+```python
+from qora import ByzantineAggregator
+
+agg = ByzantineAggregator("median", 0.0, norm_bound=10.0)
+print(agg.norm_bound)   # 10.0, or None when disabled
+```
+
+- `None` disables it. A supplied bound must be **finite and strictly
+  positive**; zero, negative, NaN, and infinite bounds raise `ValueError`
+  rather than being clamped.
+- The norm is computed in **`f64`** and compared inclusively -- a norm exactly
+  equal to the bound participates.
+- A rejected update takes its client ID and its FedAvg sample weight with it, so
+  a rejected weight never reaches the numerator or the denominator.
+- **A rejected update does not affect reputation.** A large norm is a policy
+  violation, not proof of malicious intent; this filter does not claim to detect
+  Byzantine behavior.
+- If every update is rejected -- by reputation gating, by the bound, or by a
+  mixture -- the round raises `ValueError` rather than aggregating a partial or
+  best-effort result.
+- Method quorum is checked **after** filtering, so filtering can shrink a valid
+  cohort into one Krum or Multi-Krum refuses. That is reported, not repaired.
+
+Through the Flower adapter, pass `norm_bound=` to `QoraStrategy`. The bound then
+applies to each client's complete flattened model rather than to individual
+layers.
 
 ### Reputation Tracking
 

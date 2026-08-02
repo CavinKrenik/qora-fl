@@ -23,6 +23,9 @@ Supported behavior
   would otherwise gain proportional influence over a median.
 * A client's complete model is flattened and aggregated as one update, then
   split back into the original layer shapes.
+* Optional norm-bound filtering is off unless ``norm_bound`` is configured.
+  When it is, the bound applies to the one flattened update per client, so a
+  model is judged whole rather than layer by layer.
 * Arrays are aggregated at ``float32`` precision. ``float64`` input is accepted
   and converted; its extra precision is not preserved.
 * A malformed model structure rejects the round rather than being dropped.
@@ -101,6 +104,13 @@ class QoraStrategy(FedAvg):
         aggregator, not here. Default 0.2.
     reputation_decay_rate : float
         Per-round decay toward the 0.5 default. 0.0 disables. Default 0.0.
+    norm_bound : float, optional
+        Largest L2 norm a client's *complete flattened model* may have and
+        still participate. ``None`` (the default) disables filtering entirely;
+        the adapter never enables it on its own. A supplied bound must be
+        finite and strictly positive, and is enforced by the Rust aggregator
+        against the one flattened update per client -- not per layer, which
+        would apply the bound to an arbitrary slice of the model.
     **kwargs
         Passed to ``flwr.server.strategy.FedAvg`` (``fraction_fit``,
         ``min_fit_clients``, ``accept_failures``,
@@ -113,15 +123,20 @@ class QoraStrategy(FedAvg):
         trim_fraction: float = 0.2,
         reputation_threshold: float = 0.2,
         reputation_decay_rate: float = 0.0,
+        norm_bound: Optional[float] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.aggregator = ByzantineAggregator(
-            aggregation_method, trim_fraction, ban_threshold=reputation_threshold
+            aggregation_method,
+            trim_fraction,
+            ban_threshold=reputation_threshold,
+            norm_bound=norm_bound,
         )
         self.aggregation_method = aggregation_method
         self.reputation_threshold = reputation_threshold
         self.reputation_decay_rate = reputation_decay_rate
+        self.norm_bound = norm_bound
 
     # -- Round entry point -------------------------------------------------
 

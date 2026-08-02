@@ -88,28 +88,30 @@ pub enum QoraError {
         maximum: usize,
     },
 
-    /// Reputation gating rejected every submitted client
+    /// Participation filtering rejected every submitted update
     ///
     /// Raised instead of silently restoring the rejected updates. Earlier
-    /// versions failed open here: when no client cleared the threshold the
+    /// versions failed open here: when no client cleared the ban threshold the
     /// filter was bypassed and every banned client was reinstated, which
     /// defeated the gate precisely when the reputation system distrusted the
     /// entire cohort.
     ///
+    /// Deliberately generic about *which* policy did the rejecting. Reputation
+    /// gating and norm-bound filtering both feed this variant, and a round can
+    /// mix them -- reputation removing some clients and the norm bound removing
+    /// the rest -- so a per-policy variant or a single threshold field could not
+    /// describe the outcome truthfully. The per-update reasons live in
+    /// [`crate::AggregationAuditEntry`], which
+    /// [`crate::ByzantineAggregator::aggregate_with_audit`] returns alongside
+    /// this error.
+    ///
     /// Distinct from [`QoraError::EmptyUpdates`] (updates *were* supplied) and
     /// from [`QoraError::InsufficientQuorum`] (the cause is policy, not
     /// cohort size).
-    #[error(
-        "reputation gating rejected all updates: {rejected} of {total} \
-         below threshold {threshold}"
-    )]
+    #[error("all {submitted} submitted updates were rejected")]
     AllUpdatesRejected {
         /// Number of updates submitted for the round
-        total: usize,
-        /// Number rejected by the gate (equal to `total` when this is raised)
-        rejected: usize,
-        /// The configured ban threshold that rejected them
-        threshold: f32,
+        submitted: usize,
     },
 
     /// A reputation score is outside the storable range
@@ -203,6 +205,27 @@ pub enum QoraError {
     /// Verification check failed
     #[error("Verification failed: {0}")]
     VerificationError(String),
+
+    /// A well-formed update exceeded a usable norm bound
+    ///
+    /// Carries the measurements structurally so that a caller -- including the
+    /// norm-filtering path inside [`crate::ByzantineAggregator`] -- can record
+    /// them without parsing the rendered message. `norm` is `f64` because the
+    /// norm is computed in `f64`; narrowing it to `f32` would discard the
+    /// precision that computation exists to preserve.
+    ///
+    /// Distinct from its two neighbours on purpose:
+    /// [`QoraError::NonFiniteValue`] means the update was malformed and no
+    /// meaningful norm exists, and [`QoraError::InvalidNormBound`] means the
+    /// threshold itself was unusable. Only this variant says a valid update
+    /// violated a valid policy.
+    #[error("update norm {norm:.6e} exceeds bound {bound:.6e}")]
+    NormBoundExceeded {
+        /// The update's computed L2 norm
+        norm: f64,
+        /// The configured bound it exceeded
+        bound: f32,
+    },
 
     /// A norm bound is not a usable threshold
     ///

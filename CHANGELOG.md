@@ -53,7 +53,11 @@ that exists in this repository.
   configuration runs once, giving no variance estimate. Publishing results again
   requires a pinned dataset, multiple seeds, and saved machine-readable output.
 - Documented `verification::norm_bound` and `verification::audit` as
-  unintegrated and experimental.
+  unintegrated and experimental. Superseded later in this same cycle:
+  `norm_bound` is now the shared primitive behind the opt-in aggregation filter,
+  and the legacy `verification::audit` types are deprecated in favour of the
+  root-level schema. The READMEs, `docs/TUNING.md`, and
+  `docs/VERIFICATION_INTEGRATION.md` describe the shipped behavior.
 - Fixed a non-working Rust example in the README: `trim_fraction = 0.3` with
   four clients trims every value and returns `InsufficientQuorum`.
 
@@ -310,10 +314,56 @@ that exists in this repository.
   raise `ValueError` through the existing error conversion; no new exception
   type is introduced.
 
+- **`QoraError::AllUpdatesRejected` is now generic about which policy rejected
+  the round.** It was `{ total, rejected, threshold }`, shaped for reputation
+  gating; it is now `{ submitted }`.
+
+  Norm-bound filtering raises the same variant, and a round can mix the two --
+  reputation removing some clients and the bound removing the rest -- so a
+  single threshold field cannot describe the outcome truthfully, and separate
+  per-policy variants could not represent a mixed rejection at all. Detailed
+  per-update reasons belong in `AggregationAuditEntry`, which
+  `aggregate_with_audit` returns alongside this error.
+
+  **Migration.** Rust callers destructuring the variant must replace
+  `{ total, rejected, threshold }` with `{ submitted }`; `total` is the same
+  quantity under its new name, and `rejected` always equalled it. The rendered
+  message changed from `reputation gating rejected all updates: 3 of 3 below
+  threshold 0.5` to `all 3 submitted updates were rejected`, so Python code
+  matching on the message text needs updating -- the exception type is unchanged
+  (`ValueError`). Both fields dropped were derivable or constant; nothing that
+  was recoverable from the error is now unavailable except the threshold, which
+  the caller configured and the audit record reports per client.
+
+- **Method quorum and Multi-Krum selection constraints are evaluated against the
+  final accepted cohort.** They already were for reputation gating; norm
+  filtering makes the distinction load-bearing, because a bound can shrink a
+  cohort that satisfied `n >= 2f + 3` into one that does not, or push an
+  explicit Multi-Krum `m` above `n - 2f - 2`. Both return their existing typed
+  errors (`InsufficientQuorum`, `InvalidMultiKrumSelection`) reporting the
+  accepted count. Filtering is never undone to satisfy a method: no client is
+  reinstated, `f` is not weakened, an explicit `m` is not reduced, and no
+  best-effort result is returned.
+
+- **`check_norm_bound` returns `QoraError::NormBoundExceeded` instead of
+  `QoraError::VerificationError`** for a valid update exceeding a valid bound.
+  The measurements are structural fields rather than text inside a message, so
+  the aggregation path records them without parsing. `NonFiniteValue` and
+  `InvalidNormBound` are unchanged.
+
+- **All aggregation entry points now share one internal engine.** `aggregate`,
+  `aggregate_weighted`, and the two audited methods delegate to it, so
+  validation, filtering, effective-parameter resolution, and reputation updates
+  each run exactly once and the audited and ordinary APIs cannot disagree. Each
+  candidate carries its update, client ID, sample weight, and original index as
+  one record, so a filter removes them together rather than maintaining parallel
+  vectors -- the alignment failure class already fixed once in the Flower
+  adapter.
+
 - **Reputation participation gating now fails closed.** When every submitted
-  client is below the configured `ban_threshold`, aggregation returns the new
-  `QoraError::AllUpdatesRejected { total, rejected, threshold }` instead of
-  silently restoring the banned clients and aggregating them anyway.
+  client is below the configured `ban_threshold`, aggregation returns
+  `QoraError::AllUpdatesRejected` instead of silently restoring the banned
+  clients and aggregating them anyway.
 
   The previous fallback defeated the gate in the one round where it mattered
   most -- the round where reputation distrusted the entire cohort. A client the
@@ -394,6 +444,89 @@ that exists in this repository.
 
 ### Added
 
+- **Optional norm-bound filtering on `ByzantineAggregator`.** Filtering is
+  **disabled by default** and excludes updates whose finite `f64` L2 norm
+  exceeds a configured positive bound.
+
+  Configured with `with_norm_bound_filter(bound) -> Result<Self, QoraError>`,
+  cleared with `without_norm_bound_filter()`, read back with `norm_bound()`. In
+  Python: `ByzantineAggregator(method, trim_fraction, norm_bound=...)` and
+  `QoraStrategy(..., norm_bound=...)`, where `None` is disabled. A bound must be
+  finite and strictly positive; zero, negative, NaN, and infinite bounds return
+  `QoraError::InvalidNormBound` (Python `ValueError`) rather than being clamped,
+  and the same validation runs on deserialization.
+
+  With no bound configured, no norm is computed and behavior is exactly as
+  before. With one configured:
+
+  - The norm is computed in `f64` and compared inclusively -- a norm exactly
+    equal to the bound participates, matching `check_norm_bound`, which now
+    shares the comparison through the internal `evaluate_norm_bound`.
+  - A rejected update's client ID and FedAvg sample weight are removed with it,
+    so a rejected weight cannot reach the numerator or the denominator or attach
+    to another client.
+  - **A rejected update does not affect reputation** -- no reward, no penalty,
+    no ban, and its stored score does not move however many rounds it is
+    excluded for. A norm bound is a participation filter, not a reputation
+    policy; a large norm is a policy violation rather than proof of malicious
+    intent, and this filter does not claim to detect Byzantine behavior. (This
+    reverses the tentative position in
+    `docs/VERIFICATION_INTEGRATION.md` §7, which is amended in place.)
+  - Reputation gating runs first, and a client it removes is not measured again,
+    so every submitted update carries at most one rejection reason.
+  - Malformed input still outranks filtering: empty batches, dimension
+    mismatches, non-finite values or weights, and client-ID count mismatches are
+    errors, never filtering decisions.
+  - If nothing survives, the round fails closed with
+    `QoraError::AllUpdatesRejected`.
+
+  `verification::filter_by_norm_bound` remains deprecated and is **not** used by
+  the integration: it discards errors silently and cannot report per-update
+  reasons.
+
+- **Audited aggregation.** `ByzantineAggregator::aggregate_with_audit` and
+  `aggregate_weighted_with_audit` return an `AuditedAggregation` -- the
+  aggregate plus the caller-owned `AggregationAuditEntry` schema added earlier
+  in this cycle -- or an `AuditedAggregationError`.
+
+  The error type exists because `Result<_, QoraError>` would discard the record
+  in exactly the round it matters most: `AuditedAggregationError::audit()`
+  carries the per-update reasons through an all-rejected failure. It exposes
+  `source_error()`, `audit()`, and `into_parts()`, and converts into
+  `QoraError`.
+
+  Records are handed to the caller and not retained. Nothing is persisted or
+  logged, no entry is stored inside the aggregator, and the serialized
+  aggregator does not grow with the round count.
+
+  Which failures carry a record: an all-rejected round does; input validation,
+  invalid configuration, a method-precondition failure after some candidates
+  survived, and a post-aggregation reputation failure do not. Schema version 1
+  has two outcomes -- aggregated, and all updates rejected -- and a round where
+  some candidates survived but Krum refused the reduced cohort is neither.
+  Rather than attach a record describing something that did not happen, the
+  typed error is returned alone. A future schema version may add a failure
+  outcome.
+
+  A record from an all-rejected round reports **no effective method
+  parameters**: nothing executed, so `effective_trim_fraction` and `effective_m`
+  are `None` rather than values that were never applied.
+
+- `QoraError::NormBoundExceeded { norm, bound }` -- a well-formed update
+  violating a usable bound. Structural, so the audit integration records the
+  measurements without parsing a rendered message; `norm` is `f64`, matching the
+  computation. Distinct from `NonFiniteValue` (malformed update, no meaningful
+  norm) and `InvalidNormBound` (unusable threshold).
+- `tests/norm_bound_filtering.rs` (30 tests) and `tests/audited_aggregation.rs`
+  (24 tests): default-disabled behavior, bound validation at construction and on
+  deserialization, 0.3.1 configurations restoring with filtering off, boundary
+  behavior at and either side of the bound, `f64` exactness at 1e20 and 1e-25,
+  weight and client-ID alignment through a rejection, reputation left untouched,
+  fail-closed for reputation-only, norm-only, and mixed rejection, method quorum
+  evaluated against the accepted cohort, and the audit record's contents,
+  effective parameters present after a successful round and absent after a
+  refused one, and JSON round trip. 22 Python tests cover the exposed
+  configuration through the bindings and the Flower adapter.
 - `src/validation.rs`: `validate_updates`, `validate_weights`,
   `validate_client_ids`, plus module documentation recording why non-finite
   input is rejected rather than sanitized. Crate-private, and located at the
@@ -433,13 +566,26 @@ that exists in this repository.
   runtime resolution. Being an enum, it also makes nonsense combinations such
   as a FedAvg record carrying a trim fraction unrepresentable.
 
-  Method parameters are validated too: trim fractions must be finite and
-  within `0.0..=0.5`, a non-adaptive record must apply its configured fraction,
-  `2f + 3` must not overflow, `effective_m` must be at least 1, and an explicit
-  `requested_m` must equal `effective_m` -- an explicit request is honored
-  exactly or refused, never silently resolved to something else.
-  `effective_m` is deliberately not checked against the cohort size, which the
-  entry does not know.
+  **The runtime-resolved values are `Option`.** `effective_trim_fraction` is
+  `Option<f32>` and `effective_m` is `Option<usize>`, `Some` exactly when the
+  outcome is `Aggregated`. A round that rejected every update resolved nothing:
+  no fraction was applied and no vectors were selected, so recording a value
+  there would name a parameter that never executed. This matters most for a
+  bare `"multi_krum"`, whose `m` is resolved against the accepted cohort --
+  with an empty cohort there is nothing to cap the default against.
+  Configuration is still reported in full, since the configured fraction, the
+  `adaptive` flag, `f`, and `requested_m` are known regardless of what ran.
+
+  Method parameters are validated too, on construction *and* deserialization:
+  trim fractions must be finite and within `0.0..=0.5`, a non-adaptive record
+  must apply its configured fraction, `2f + 3` must not overflow, `effective_m`
+  must be at least 1, and an explicit `requested_m` must equal `effective_m` --
+  an explicit request is honored exactly or refused, never silently resolved to
+  something else. The effective values are checked against the outcome in both
+  directions: `Aggregated` carrying `None` is rejected because something ran and
+  the parameter it ran with exists, and `AllUpdatesRejected` carrying `Some` is
+  rejected because nothing ran. `effective_m` is deliberately not checked
+  against the cohort size, which the entry does not know.
 
   Entries carry no timestamps, round numbers, experiment identifiers, or model
   data -- the library has no clock, no notion of a training round, and no
@@ -458,8 +604,8 @@ that exists in this repository.
   they are documented as superseded.
 - `QoraError::InvalidAuditEntry { reason }` -- raised when an audit entry would
   not describe a possible aggregation attempt.
-- `QoraError::AllUpdatesRejected { total, rejected, threshold }` -- raised when
-  reputation gating leaves no client.
+- `QoraError::AllUpdatesRejected { submitted }` -- raised when participation
+  filtering leaves no client.
 - `QoraError::InvalidReputationScore`, `InvalidReputationAdjustment`,
   `InvalidReputationDecay`, `InvalidReputationThreshold`, and
   `NonFiniteReputationDistance` -- typed rejections for each reputation input
@@ -511,11 +657,24 @@ that exists in this repository.
   necessarily belongs before encoding, which is where
   `ByzantineAggregator::aggregate` performs it.
 
-- `verification::norm_bound` and `verification::audit` remain unwired from the
-  aggregation path. Connecting them requires policy decisions (mandatory or
-  opt-in norm checking; who selects the bound; whether rejection affects
-  reputation; behavior when every update is rejected; whether the audit log is
-  automatic, caller-owned, bounded, or persistent) and is out of scope here.
+- **Audit records cover two outcomes, not every failure.** Schema version 1
+  distinguishes a round that aggregated from one where filtering rejected
+  everything. A method-precondition failure after some candidates survived, and
+  a reputation failure after aggregating, are neither, so no record is produced
+  for them -- `AuditedAggregationError::audit()` returns `None` and the typed
+  error is returned alone. Representing them requires a new outcome and a schema
+  version bump.
+
+- **The norm bound is a fixed value the caller picks.** Adaptive or
+  percentile-derived bounds are a separate design and deliberately not the first
+  version: an adaptive bound is attacker-influenceable, since enough colluding
+  clients can drag it upward.
+
+- **Audit records are not exposed to Python.** The Rust API returns typed,
+  versioned entries; mirroring that as a hierarchy of Python classes would
+  freeze a binding design while the schema is still experimental. A later
+  binding can return the serialized shape as a dictionary. Norm-bound
+  *configuration* is exposed.
 
 ## [0.3.1] - 2026-02-08
 

@@ -946,7 +946,7 @@ fn test_krum_returns_original_f32_values() {
     let result = agg.aggregate(&updates, None).unwrap();
 
     // Result must be exactly one of the honest input vectors (no quantization)
-    let is_exact_match = updates[..4].iter().any(|u| u == &result);
+    let is_exact_match = updates[..4].contains(&result);
     assert!(
         is_exact_match,
         "Result should be an exact copy of one input vector, got {:?}",

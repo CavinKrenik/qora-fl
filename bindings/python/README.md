@@ -167,9 +167,20 @@ Details that affect configuration:
 
 ## Quick Start (Python + Flower)
 
+Flower is an **optional** extra. The core bindings work without it:
+`import qora`, `ByzantineAggregator`, and `ReputationManager` all function with
+Flower absent. Only `qora.QoraStrategy` requires it, and importing it without
+Flower installed raises an `ImportError` naming the extra to install.
+
 ```bash
-pip install qora-fl[flower]
+# Quote the extra: some shells (zsh, fish) treat brackets as globs.
+pip install "qora-fl[flower]"
 ```
+
+Supported range **`flwr>=1.5,<2`**, upper-bounded because the adapter targets
+Flower's 1.x strategy interface. **CI tests both ends explicitly: 1.5.0 and
+1.32.1.** Versions in between are covered by the declared promise but are not
+individually exercised.
 
 ```python
 import flwr as fl
@@ -179,6 +190,7 @@ strategy = QoraStrategy(
     aggregation_method="trimmed_mean",
     trim_fraction=0.2,
     min_fit_clients=5,
+    # norm_bound=None by default: no filtering, no norm computation.
 )
 
 fl.server.start_server(
@@ -188,7 +200,41 @@ fl.server.start_server(
 )
 ```
 
-`QoraStrategy` inherits from `FedAvg` -- all standard Flower parameters (`fraction_fit`, `min_fit_clients`, `initial_parameters`, etc.) work as expected.
+`QoraStrategy` inherits from `FedAvg`, so standard Flower parameters
+(`fraction_fit`, `min_fit_clients`, `initial_parameters`, `accept_failures`,
+`fit_metrics_aggregation_fn`) are accepted. It is a **compatibility adapter**,
+not a behavioral replacement for every Flower built-in strategy.
+
+What the adapter does:
+
+- **One client result becomes one complete Rust update.** Each client's model is
+  flattened into a single update, aggregated in one call, then split back into
+  the original layer shapes. Aggregating layer by layer would let a selection
+  method pick a different client per layer and return a model no client
+  submitted.
+- **Validates the complete model structure** against the first client as
+  reference: layer count, per-layer shape, floating-point dtype, and finiteness.
+  A malformed successful result raises `ValueError` naming the client and layer
+  rather than being dropped -- discarding it would change the round's effective
+  adversarial fraction.
+- **Aggregates at `float32`.** `float64` input is accepted and converted; its
+  extra precision is not preserved. **Integer parameter arrays are rejected**
+  rather than silently coerced into trainable floats.
+- **FedAvg weights by `num_examples`.** Robust methods (median, trimmed mean,
+  Krum, Multi-Krum) treat each accepted client update as one participant --
+  `num_examples` is never reinterpreted as an algorithmic weight there, since an
+  attacker claiming a large sample count would otherwise gain proportional
+  influence over a median.
+- **Honors `accept_failures`.** Reported failures refuse the round when it is
+  False, returning `(None, {})` without invoking Rust, moving reputation, or
+  calling the metrics callback.
+- **Aggregates metrics only through `fit_metrics_aggregation_fn`.** With none
+  configured it returns `{}`. Reputation is available through
+  `QoraStrategy.get_reputation(client_id)`.
+- **Performs no gating of its own.** Reputation gating and updates happen once,
+  in the Rust aggregator.
+- **Enables norm-bound filtering only when `norm_bound` is passed**, and applies
+  it to the complete flattened model rather than to individual layers.
 
 ## Python (Standalone)
 
@@ -241,6 +287,20 @@ print(agg.norm_bound)   # 10.0, or None when disabled
 Through the Flower adapter, pass `norm_bound=` to `QoraStrategy`. The bound then
 applies to each client's complete flattened model rather than to individual
 layers.
+
+### Audit records are Rust-only in 0.4.0
+
+The Rust API returns a typed, versioned `AggregationAuditEntry` from
+`aggregate_with_audit`, recording one decision per submitted update with typed
+rejection reasons. **The Python bindings do not expose it.** Mirroring the schema
+as a hierarchy of Python classes would freeze a binding design while the schema
+is still experimental; a later release can return the serialized shape as a
+dictionary instead.
+
+What Python does expose is the configuration (`norm_bound`) and the behavior it
+produces: an over-bound update is excluded, and a round that rejects everything
+raises `ValueError`. The per-client reasons behind that error are not available
+from Python yet.
 
 ### Reputation Tracking
 

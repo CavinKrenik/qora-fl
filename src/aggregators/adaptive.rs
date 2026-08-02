@@ -36,7 +36,7 @@ mod tests {
 
     #[test]
     fn test_no_suspicious() {
-        let scores = vec![0.8, 0.7, 0.9, 0.6, 0.75];
+        let scores = [0.8, 0.7, 0.9, 0.6, 0.75];
         let trim = compute_adaptive_trim(scores.iter(), 0.4, 0.05, 0.05);
         // 0 suspicious -> 0.0 + 0.05 = 0.05
         assert!((trim - 0.05).abs() < 1e-6);
@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn test_all_suspicious() {
-        let scores = vec![0.1, 0.2, 0.3, 0.1, 0.15];
+        let scores = [0.1, 0.2, 0.3, 0.1, 0.15];
         let trim = compute_adaptive_trim(scores.iter(), 0.4, 0.05, 0.05);
         // All 5 suspicious -> 1.0 + 0.05 = 1.05, clamped to 0.49
         assert!((trim - 0.49).abs() < 1e-6);
@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn test_30_percent_suspicious() {
-        let scores = vec![0.1, 0.2, 0.3, 0.7, 0.8, 0.9, 0.6, 0.7, 0.8, 0.75];
+        let scores = [0.1, 0.2, 0.3, 0.7, 0.8, 0.9, 0.6, 0.7, 0.8, 0.75];
         let trim = compute_adaptive_trim(scores.iter(), 0.4, 0.05, 0.05);
         // 3/10 suspicious -> 0.30 + 0.05 = 0.35
         assert!((trim - 0.35).abs() < 1e-6);
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn test_safety_margin_effect() {
-        let scores = vec![0.5, 0.6, 0.7, 0.8];
+        let scores = [0.5, 0.6, 0.7, 0.8];
         let trim_low = compute_adaptive_trim(scores.iter(), 0.4, 0.0, 0.0);
         let trim_high = compute_adaptive_trim(scores.iter(), 0.4, 0.2, 0.0);
         assert!(trim_high > trim_low);
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn test_min_trim_floor() {
-        let scores = vec![0.9, 0.9, 0.9];
+        let scores = [0.9, 0.9, 0.9];
         let trim = compute_adaptive_trim(scores.iter(), 0.4, 0.0, 0.1);
         // 0 suspicious, margin 0.0, but min_trim 0.1 enforced
         assert!((trim - 0.1).abs() < 1e-6);

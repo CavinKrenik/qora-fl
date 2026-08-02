@@ -23,6 +23,13 @@ clients.
 > security review. Robustness depends on each method's stated assumptions,
 > threat model, and correct configuration.
 
+> [!WARNING]
+> **Upgrading from 0.3.x?** 0.4.0 is a breaking release: several calls now
+> return `Result`, Krum and Multi-Krum refuse inputs that violate their
+> preconditions instead of returning a best-effort answer, and the Flower
+> adapter aggregates each client's complete model rather than one layer at a
+> time. See [docs/MIGRATING_TO_0.4.md](docs/MIGRATING_TO_0.4.md).
+
 ## Currently implemented
 
 Behavior available through tested public paths:
@@ -157,7 +164,8 @@ Details that affect configuration:
 ## Quick Start (Python + Flower)
 
 ```bash
-pip install qora-fl[flower]
+# Quote the extra: some shells (zsh, fish) treat brackets as globs.
+pip install "qora-fl[flower]"
 ```
 
 ```python
@@ -168,6 +176,7 @@ strategy = QoraStrategy(
     aggregation_method="trimmed_mean",
     trim_fraction=0.2,
     min_fit_clients=5,
+    # norm_bound=None by default: no filtering, no norm computation.
 )
 
 fl.server.start_server(
@@ -260,14 +269,9 @@ produce per-update reasons.
 
 ## Audit records
 
-`ByzantineAggregator::aggregate_with_audit` returns the aggregate plus an
-`AggregationAuditEntry`: one decision per submitted update, at its original
-index, with a typed reason for each rejection and the **effective** method
-parameters that actually ran.
-
-Records are **caller-owned**. Qora-FL does not persist them, does not keep a
-log, and stores nothing inside the aggregator -- an entry is handed over once
-and forgotten, so the serialized aggregator does not grow with the round count.
+`ByzantineAggregator::aggregate_with_audit` and
+`aggregate_weighted_with_audit` return the aggregate plus an
+`AggregationAuditEntry` describing what the round decided.
 
 ```rust
 use qora_fl::ByzantineAggregator;
@@ -283,12 +287,60 @@ let round = agg.aggregate_with_audit(&updates, None)?;
 assert_eq!(round.audit().rejected_count(), 1);
 ```
 
+What an entry contains:
+
+- **One decision per submitted update**, so every input has exactly one
+  disposition and the counts are derived rather than stored alongside.
+- The **original update index**. Filtering does not renumber: rejecting update 1
+  of 4 leaves the survivors at 0, 2, 3.
+- The **client ID the caller supplied**, or `None` when aggregation ran without
+  IDs. Never synthesized from a position.
+- A **typed rejection reason** -- `ReputationBelowThreshold { score, threshold }`
+  or `NormBoundExceeded { norm, bound }` -- with the measurements as fields
+  rather than text.
+- Both the **requested configuration and the effective execution parameters**:
+  the configured and applied trim fractions with an `adaptive` flag, and
+  `requested_m` alongside the resolved `effective_m`.
+
+The effective values are `Option`, and are `None` when filtering prevented the
+method from running at all. A round that rejected every update applied no trim
+fraction and selected no vectors, so recording either would name a parameter
+that never executed. The schema enforces this in both directions: an aggregated
+round must carry them, and a refused round must not.
+
+Which failures carry a record:
+
+| Failure | Record |
+|---|---|
+| Every update rejected by filtering | Yes -- with each rejection reason |
+| Input validation (empty, dimension, non-finite, ID count) | No |
+| Invalid configuration (unusable bound, weights on a robust method) | No |
+| Method precondition after some candidates survived (Krum quorum, Multi-Krum `m`) | No |
+
 Ordinary `aggregate` returns only the aggregate or only the error. The audited
 API additionally preserves the decisions across the all-rejected failure, which
 is the round they matter most for. Schema version 1 has two outcomes --
 aggregated, and all updates rejected -- so a method-precondition failure after
-some candidates survived returns the typed error with no record rather than one
-that would describe something that did not happen.
+some candidates survived returns the typed error alone rather than a record that
+would describe something that did not happen.
+
+### What audit records are not
+
+Records are **caller-owned**. Qora-FL does not persist them, does not keep a
+log, and stores nothing inside the aggregator -- an entry is handed over once
+and forgotten, so the serialized aggregator does not grow with the round count.
+Timestamps, round numbers, experiment identifiers, storage, and retention are
+all caller concerns; the library has no clock and no notion of a training round.
+
+A serializable record is **not a tamper-proof audit log.** Nothing here is
+signed, hashed, chained, or ordered, and integrity is entirely the caller's
+problem. Entries improve observability; they are not evidence.
+
+Entries may carry client identifiers, which can be sensitive. Since persistence
+is caller-owned, so is that decision.
+
+Audit records are **not exposed to Python** in 0.4.0. The Python bindings expose
+norm-bound configuration only; see [Roadmap](#roadmap).
 
 ## Python (Standalone)
 
@@ -373,8 +425,9 @@ let avg = fedavg(&updates, None).unwrap();
 
 ## Aggregation methods and their assumptions
 
-`n` is the number of accepted client updates; `f` is the configured Byzantine
-bound; `m` is the number of Multi-Krum candidates selected.
+`n` is the number of **accepted** client updates -- the cohort that remains after
+reputation gating and norm-bound filtering, not the number submitted. `f` is the
+configured Byzantine bound; `m` is the number of Multi-Krum candidates selected.
 
 | Method | Enforced precondition | Assumption for robustness |
 |---|---|---|
@@ -513,9 +566,10 @@ Qora-FL, and none of the evidence in this repository is inherited from it.
 - **Rust:** edition 2021, stable toolchain
 - **Python:** >= 3.8 (bindings built with PyO3 abi3)
 - **NumPy:** >= 1.21.0
-- **Flower** (optional): `>=1.5,<2` (`pip install qora-fl[flower]`). Tested in
+- **Flower** (optional): `>=1.5,<2` (`pip install "qora-fl[flower]"`). Tested in
   CI at 1.5.0 and 1.32.1. `import qora` works without it; only
-  `qora.QoraStrategy` requires it.
+  `qora.QoraStrategy` requires it, and raises an `ImportError` naming the extra
+  when it is missing.
 
 ### Building from Source
 

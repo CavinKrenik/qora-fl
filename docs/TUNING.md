@@ -116,22 +116,47 @@ ByzantineAggregator(method, trim_fraction, norm_bound=bound)
 QoraStrategy(aggregation_method=method, norm_bound=bound)
 ```
 
-**Choosing a bound.** There is no default worth having, and the library does not
-guess one. The right L2 bound depends on model scale, learning rate, local epoch
-count, and whether updates are deltas or full weights. Derive it from a few
-observed rounds of honest clients and set it with headroom -- a bound tighter
-than legitimate variation rejects honest work, which fails the round outright
-once it rejects everyone.
+**Choosing a bound.** The library does not infer one, and **no bound in this
+document is optimal or recommended** -- there is no value that is correct
+independent of the model being trained.
+
+What the right bound depends on:
+
+- **Model scale.** A bound is an absolute magnitude over the flattened update, so
+  it scales with parameter count. A value tuned for a small MLP means something
+  entirely different for a model an order of magnitude larger.
+- **Update representation.** Gradient deltas and full weight vectors have
+  completely different norm ranges. A bound derived for one is meaningless for
+  the other.
+- **Training stage.** Update norms typically shrink as training converges. A
+  bound set from early rounds may filter nothing later; one set from late rounds
+  may reject the whole cohort at the start.
+- **Learning rate and local epoch count**, both of which scale how far a client
+  moves per round.
+
+**A fixed absolute bound does not transfer between models, representations, or
+training stages.** Re-derive it rather than carrying it across experiments.
+
+**Observe before enforcing.** Run rounds with filtering disabled and record the
+distribution of honest update norms first. Only then set a bound, with headroom
+above the observed honest maximum. Enforcing a bound chosen without measurement
+is how a round ends up rejecting every client.
 
 | Setting | Behavior |
 |---|---|
 | unset (`None`) | No filtering, no norm computation. **Default.** |
-| Well above the honest maximum | Catches only extreme magnitude attacks |
+| Well above the honest maximum | Catches only extreme magnitude attacks; may filter nothing at all |
 | Near the honest maximum | Tighter, with a real false-positive risk |
-| Below honest variation | Rejects honest clients; an all-rejected round fails |
+| Below honest variation | Rejects honest clients; an all-rejected round fails closed |
 
 A bound must be finite and strictly positive. Zero, negative, NaN, and infinite
 bounds are rejected at construction and on deserialization, not clamped.
+
+**Reputation gating and norm filtering mean different things** and are configured
+independently. Gating acts on accumulated cross-round evidence about a client's
+behavior; the norm bound acts on a single update's magnitude in a single round,
+with no memory and no verdict about the client. Neither substitutes for the
+other, and a client excluded by the bound is not thereby distrusted.
 
 What filtering does and does not do:
 
@@ -142,10 +167,14 @@ What filtering does and does not do:
   not a verdict about the client. A large norm is a policy violation rather than
   proof of malicious intent.
 - If nothing survives, the round returns `AllUpdatesRejected`.
-- Method quorum is evaluated after filtering, so a bound that removes clients can
-  push Krum or Multi-Krum below `n >= 2f + 3`, or push an explicit Multi-Krum `m`
-  above `n - 2f - 2`. Both are reported as their existing typed errors. Budget
-  for this when combining a tight bound with a large `f`.
+- Method quorum is evaluated after filtering, against the **accepted** cohort.
+  In `n >= 2f + 3` and `1 <= m <= n - 2f - 2`, `n` is the number of updates that
+  survived gating and filtering -- not the number submitted. A bound that removes
+  clients can therefore push Krum or Multi-Krum below quorum, or push an explicit
+  Multi-Krum `m` above the safe maximum, and both are reported as their existing
+  typed errors rather than repaired. Budget for this when combining a tight bound
+  with a large `f`: a cohort sized exactly at `2f + 3` has no margin for a single
+  norm rejection.
 
 `verification::check_norm_bound` remains available as a standalone predicate and
 shares the same comparison. `filter_by_norm_bound` is deprecated and unused: it

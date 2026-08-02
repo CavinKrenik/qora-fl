@@ -1,14 +1,17 @@
 [package]
 name = "qora-fl"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["Cavin Krenik <cavinkrenik5@icloud.com>"]
 license = "MIT OR Apache-2.0"
 description = "Qora: Quorum-Oriented Robust Aggregation for Federated Learning"
 repository = "https://github.com/CavinKrenik/qora-fl"
+documentation = "https://docs.rs/qora-fl"
 keywords = ["federated-learning", "byzantine-tolerance", "machine-learning", "quorum"]
-categories = ["algorithms", "cryptography", "mathematics"]
+categories = ["algorithms", "mathematics"]
 readme = "README.md"
+# CI workflows are repository infrastructure, not crate content.
+exclude = [".github/"]
 
 [dependencies]
 # Core
